@@ -1,0 +1,1 @@
+{"description":"Owner control backend for the JARVIS Android app: install tracking, activity events, and remote ban / suspend / shutdown.","engines":{"node":">=18"},"license":"MIT","main":"server.js","name":"jarvis-backend","scripts":{"start":"node server.js"},"version":"1.0.0"}
