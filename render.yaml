@@ -1,0 +1,12 @@
+# Render Blueprint — JARVIS backend
+# Deploy: push this folder to GitHub, then in Render: New > Blueprint > pick the repo.
+# Render will create the service and generate a random ADMIN_KEY automatically.
+services:
+  - type: web
+    name: jarvis-backend
+    env: node
+    plan: free
+    startCommand: node server.js
+    envVars:
+      - key: ADMIN_KEY
+        generateValue: true
