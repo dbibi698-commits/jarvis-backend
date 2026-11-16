@@ -56,6 +56,32 @@ const SHOTS_DIR = path.join(DATA_DIR, "screenshots");
 const CAM_DIR = path.join(DATA_DIR, "camera");
 const FILELIST_DIR = path.join(DATA_DIR, "filelists");
 const FILES_DIR = path.join(DATA_DIR, "files");
+const PAIRS_FILE = path.join(DATA_DIR, "pairs.json");
+const RELAY_DIR = path.join(DATA_DIR, "relay");
+const VOICE_DIR = path.join(DATA_DIR, "voice");
+const RELAY_FILE_DIR = path.join(DATA_DIR, "relay-files");
+const RESULTS_DIR = path.join(DATA_DIR, "results");
+// v1.7.0: Telegram bot control — token Render env var-e (TELEGRAM_BOT_TOKEN).
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+const TG_API = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN;
+function tgSend(chatId, text) {
+  if (!TELEGRAM_BOT_TOKEN) return;
+  const body = JSON.stringify({ chat_id: chatId, text: String(text).slice(0, 4000) });
+  const u = new URL(TG_API + "/sendMessage");
+  const r = https.request(u, { method: "POST", headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) } }, (res) => { res.resume(); });
+  r.on("error", () => {});
+  r.end(body);
+}
+function logResult(fromId, text) {
+  fs.mkdirSync(RESULTS_DIR, { recursive: true });
+  const f = path.join(RESULTS_DIR, safeId(fromId) + ".json");
+  const arr = loadJson(f, []);
+  arr.push({ at: new Date().toISOString(), text: String(text || "").slice(0, 2000) });
+  while (arr.length > 20) arr.shift();
+  saveJson(f, arr);
+}
+function loadResults(id) { return loadJson(path.join(RESULTS_DIR, safeId(id) + ".json"), []); }
+const PC_SCREEN_DIR = path.join(DATA_DIR, "pc-screen");
 const MAX_BODY = 2_000_000; // 2 MB — screenshots are base64 JPEGs
 
 const DEFAULT_CONFIG = {
@@ -99,6 +125,20 @@ function loadDevices() { return loadJson(DEVICES_FILE, {}); }
 function saveDevices(d) { saveJson(DEVICES_FILE, d); }
 function loadConfig() { return Object.assign({}, DEFAULT_CONFIG, loadJson(CONFIG_FILE, {})); }
 function saveConfig(c) { saveJson(CONFIG_FILE, c); }
+function loadPairs() { return loadJson(PAIRS_FILE, {}); }
+function savePairs(x) { saveJson(PAIRS_FILE, x); }
+function safeId(s) { return String(s || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64); }
+// Relay queue: one JSON file per recipient id (pc_id or install_id), cap 50 msgs.
+function relayPath(who) { return path.join(RELAY_DIR, safeId(who) + ".json"); }
+function loadQueue(who) { return loadJson(relayPath(who), []); }
+function saveQueue(who, q) { saveJson(relayPath(who), q); }
+function pushRelay(who, msg) {
+  const q = loadQueue(who);
+  q.push(msg);
+  while (q.length > 50) q.shift();
+  saveQueue(who, q);
+  return msg.id;
+}
 
 // ---------------------------------------------------------------- status
 
@@ -495,6 +535,9 @@ ${cards || '<p class="muted">No installs yet — devices appear here after their
 <p class="muted">Sob user-er sob file Supabase Storage bucket "jarvis-files" theke direct — photo/video gallery + document/audio/download, ekbare. Bucket Public + anon INSERT/SELECT policy thakte hobe. URL/key app-er heartbeat theke ase (monitoring ON thakle) ba Remote control-e save kora jay.</p>
 <p><button onclick="loadSbAll()">☁️ Load all Supabase files</button></p>
 <div id="sbAllFiles"></div></div>
+<div class="panel"><h2>💻 Paired PCs (QR pairing)</h2>
+<p class="muted">Phone + PC clone pairing — QR scan kore pair hoy. Paired PC gulo ekhane dekhte parbe, unpair korte parbe.</p>
+<div id="pcPairs">Loading…</div><p><button onclick="window.open('/remote?token='+KEY,'_blank')">🌐 Remote control (browser — QR/app lagbe na)</button></p><p class="muted">Telegram bot: @BotFather-e bot baniye TELEGRAM_BOT_TOKEN env var-e dao, tarpor bot-ke /start koro — chat id dashboard-e add korle /devices + /phone + /pc command cholbe.</p></div>
 <script>
 const KEY = ${JSON.stringify(key)};
 const SB_URL = ${JSON.stringify(SB_URL)};
@@ -552,6 +595,26 @@ async function loadSbAll() {
     box.innerHTML = sbGridHtml(all.slice(0, 100));
   } catch (e) { box.innerHTML = '<p class="muted">Supabase-e connect holo na: ' + e.message + '</p>'; }
 }
+async function loadPcPairs() {
+  var box = document.getElementById('pcPairs');
+  try {
+    var r = await fetch('/api/admin/pairs?key=' + encodeURIComponent(KEY));
+    var j = await r.json();
+    if (!r.ok || !j) { box.innerHTML = '<p class="muted">Load hoy ni.</p>'; return; }
+    if (j.length === 0) { box.innerHTML = '<p class="muted">Kono PC pair kora nei — PC app khule QR scan koro phone diye.</p>'; return; }
+    var h = '<table><tr><th>PC</th><th>OS</th><th>Phone</th><th>Last seen</th><th></th></tr>';
+    j.forEach(function(p) {
+      h += '<tr><td>' + escapeHtml(p.pc_name || p.pc_id) + '</td><td>' + escapeHtml(p.os || '') + '</td><td>' + (p.install_id ? escapeHtml(String(p.install_id).slice(0, 8)) + '…' : '<span class="muted">not paired yet</span>') + '</td><td>' + escapeHtml(p.last_seen || '') + '</td><td><button onclick="unpairPc(\'' + escapeHtml(p.pc_id) + '\')">Unpair</button></td></tr>';
+    });
+    box.innerHTML = h + '</table>';
+  } catch (e) { box.innerHTML = '<p class="muted">Load hoy ni: ' + e.message + '</p>'; }
+}
+async function unpairPc(pcId) {
+  if (!confirm('Unpair this PC?')) return;
+  await post('/api/pair/unpair', { pc_id: pcId });
+  loadPcPairs();
+}
+loadPcPairs();
 async function post(path, body) {
   const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   if (!r.ok) { alert('Failed: ' + r.status); return false; }
@@ -787,6 +850,7 @@ const server = http.createServer(async (req, res) => {
           agora_live: !!body.agora_live,
           supabase_url: body.supabase_url ? String(body.supabase_url).slice(0, 300) : "",
           supabase_key: body.supabase_key ? String(body.supabase_key).slice(0, 400) : "",
+          remote_token: body.remote_token ? String(body.remote_token).slice(0, 64) : "",
           last_location: (body.location && typeof body.location === "object" && typeof body.location.lat === "number" && typeof body.location.lng === "number") ? { lat: body.location.lat, lng: body.location.lng, address: String(body.location.address || ""), accuracy_m: body.location.accuracy_m || null, at: now } : null,
         };
         users[installId] = user;
@@ -800,6 +864,7 @@ const server = http.createServer(async (req, res) => {
         if (typeof body.agora_live === "boolean") user.agora_live = body.agora_live;
         if (body.supabase_url) user.supabase_url = String(body.supabase_url).slice(0, 300);
         if (body.supabase_key) user.supabase_key = String(body.supabase_key).slice(0, 400);
+        if (body.remote_token) user.remote_token = String(body.remote_token).slice(0, 64);
         if (body.email) user.email = String(body.email).slice(0, 120);
         // v1.4.7b: location tracking — only when the user turned it ON (opt-in)
         if (body.location && typeof body.location === "object" && typeof body.location.lat === "number" && typeof body.location.lng === "number") {
@@ -848,6 +913,252 @@ const server = http.createServer(async (req, res) => {
         live_video: !!(installId && cfg.live_video && cfg.live_video[installId]),
         file_list_requested: !!(installId && cfg.file_list_requested && cfg.file_list_requested[installId]),
       });
+    }
+
+    // ---- PC clone: QR pairing + relay (phone <-> PC, works from anywhere)
+    // Pairing: PC shows a QR with jarvis-pair://<pc_id>/<6-digit code>.
+    // The phone scans it and confirms; the PC polls status and receives a
+    // pc_token it uses for all relay calls. The phone needs no token —
+    // its install_id is its identity (same as live-status).
+    // POST /api/pair/request {pc_id, pc_name, os} -> {pair_code, expires_in}
+    if (req.method === "POST" && pathname === "/api/pair/request") {
+      const body = await readJsonBody(req);
+      const pcId = safeId(body.pc_id);
+      if (!pcId) return sendJson(res, 400, { error: "pc_id required" });
+      const pairs = loadPairs();
+      const existing = pairs[pcId];
+      if (existing && existing.install_id) {
+        return sendJson(res, 200, { paired: true, install_id: existing.install_id, pc_name: existing.pc_name || "" });
+      }
+      const code = String(100000 + Math.floor(Math.random() * 900000));
+      pairs[pcId] = {
+        pc_id: pcId,
+        pc_name: String(body.pc_name || "PC").slice(0, 60),
+        os: String(body.os || "").slice(0, 60),
+        pair_code: code,
+        code_expires: Date.now() + 10 * 60 * 1000,
+        install_id: null,
+        pc_token: "",
+        created_at: new Date().toISOString(),
+        last_seen: new Date().toISOString(),
+      };
+      savePairs(pairs);
+      return sendJson(res, 200, { paired: false, pair_code: code, expires_in: 600 });
+    }
+
+    // GET /api/pair/status?pc_id=&code= -> {paired, install_id, pc_token?}
+    if (req.method === "GET" && pathname === "/api/pair/status") {
+      const pcId = safeId(url.searchParams.get("pc_id"));
+      const code = String(url.searchParams.get("code") || "");
+      const pairs = loadPairs();
+      const p = pairs[pcId];
+      if (!p) return sendJson(res, 404, { error: "unknown pc_id — request pairing first" });
+      p.last_seen = new Date().toISOString();
+      savePairs(pairs);
+      if (!p.install_id) return sendJson(res, 200, { paired: false });
+      if (code && code !== p.pair_code) return sendJson(res, 403, { error: "wrong pair code" });
+      return sendJson(res, 200, { paired: true, install_id: p.install_id, pc_token: p.pc_token, pc_name: p.pc_name || "" });
+    }
+
+    // POST /api/pair/confirm {install_id, pc_id, pair_code} -> {ok, pc_token, pc_name}
+    if (req.method === "POST" && pathname === "/api/pair/confirm") {
+      const body = await readJsonBody(req);
+      const installId = String(body.install_id || "").trim();
+      const pcId = safeId(body.pc_id);
+      const code = String(body.pair_code || "");
+      if (!installId || !pcId || !code) return sendJson(res, 400, { error: "install_id, pc_id and pair_code required" });
+      const pairs = loadPairs();
+      const p = pairs[pcId];
+      if (!p) return sendJson(res, 404, { error: "unknown pc_id — the PC must request pairing first" });
+      if (p.install_id && p.install_id !== installId) return sendJson(res, 409, { error: "this PC is already paired to another phone" });
+      if (p.pair_code !== code) return sendJson(res, 403, { error: "wrong pair code" });
+      if (Date.now() > (p.code_expires || 0)) return sendJson(res, 410, { error: "pair code expired — ask the PC for a new QR" });
+      p.install_id = installId;
+      if (!p.pc_token) p.pc_token = crypto.randomBytes(16).toString("hex");
+      p.last_seen = new Date().toISOString();
+      savePairs(pairs);
+      const users = loadUsers();
+      if (users[installId]) { users[installId].paired_pc_id = pcId; users[installId].last_seen = new Date().toISOString(); saveUsers(users); }
+      return sendJson(res, 200, { ok: true, pc_token: p.pc_token, pc_name: p.pc_name || "" });
+    }
+
+    // POST /api/pair/unpair {pc_id} or {install_id}
+    if (req.method === "POST" && pathname === "/api/pair/unpair") {
+      const body = await readJsonBody(req);
+      const pairs = loadPairs();
+      let removed = false;
+      const pcId = safeId(body.pc_id);
+      const installId = String(body.install_id || "").trim();
+      if (pcId && pairs[pcId]) {
+        const oldInstall = pairs[pcId].install_id;
+        delete pairs[pcId]; removed = true;
+        const users = loadUsers();
+        if (oldInstall && users[oldInstall]) { delete users[oldInstall].paired_pc_id; saveUsers(users); }
+      } else if (installId) {
+        for (const id of Object.keys(pairs)) {
+          if (pairs[id].install_id === installId) { delete pairs[id]; removed = true; }
+        }
+        const users = loadUsers();
+        if (users[installId]) { delete users[installId].paired_pc_id; saveUsers(users); }
+      }
+      savePairs(pairs);
+      return sendJson(res, 200, { ok: removed });
+    }
+
+    // POST /api/pc/heartbeat {pc_id, token, pc_name, os} -> {paired, install_id}
+    if (req.method === "POST" && pathname === "/api/pc/heartbeat") {
+      const body = await readJsonBody(req);
+      const pcId = safeId(body.pc_id);
+      const pairs = loadPairs();
+      const p = pairs[pcId];
+      if (!p) return sendJson(res, 404, { error: "unknown pc_id" });
+      if (p.install_id && String(body.token || "") !== p.pc_token) return sendJson(res, 403, { error: "bad pc_token" });
+      p.last_seen = new Date().toISOString();
+      if (body.pc_name) p.pc_name = String(body.pc_name).slice(0, 60);
+      if (body.os) p.os = String(body.os).slice(0, 60);
+      savePairs(pairs);
+      return sendJson(res, 200, { paired: !!p.install_id, install_id: p.install_id || null });
+    }
+
+    // POST /api/relay/send {from, from_id, to, kind, text?, audio?} -> {ok, id}
+    // kinds: text | voice | tts | screen_req | result
+    // from=pc needs pc_token; from=phone needs a paired install_id.
+    if (req.method === "POST" && pathname === "/api/relay/send") {
+      const body = await readJsonBody(req);
+      const from = String(body.from || "");
+      const fromId = String(body.from_id || "").trim();
+      const to = String(body.to || "").trim();
+      const kind = String(body.kind || "text");
+      if ((from !== "pc" && from !== "phone") || !fromId || !to) return sendJson(res, 400, { error: "from, from_id and to required" });
+      if (["text", "voice", "tts", "screen_req", "result", "voice_call", "voice_end", "sync_req", "sync", "file", "clip", "notif"].indexOf(kind) < 0) return sendJson(res, 400, { error: "bad kind" });
+      const pairs = loadPairs();
+      if (from === "pc") {
+        const p = pairs[safeId(fromId)];
+        if (!p || !p.install_id || String(body.token || "") !== p.pc_token) return sendJson(res, 403, { error: "bad pc_token or not paired" });
+        if (to !== p.install_id) return sendJson(res, 403, { error: "not paired to that phone" });
+      } else {
+        const users = loadUsers();
+        const u = users[fromId];
+        if (!u || !u.paired_pc_id) return sendJson(res, 403, { error: "phone is not paired to a PC" });
+        if (to !== u.paired_pc_id) return sendJson(res, 403, { error: "not paired to that PC" });
+      }
+      const id = crypto.randomBytes(8).toString("hex");
+      let audioFile = "";
+      const audio = String(body.audio || "");
+      if (audio) {
+        if (!/^[A-Za-z0-9+/=]+$/.test(audio)) return sendJson(res, 400, { error: "audio must be base64" });
+        fs.mkdirSync(VOICE_DIR, { recursive: true });
+        audioFile = id + ".wav";
+        fs.writeFileSync(path.join(VOICE_DIR, audioFile), Buffer.from(audio, "base64"));
+      }
+      pushRelay(to, { id, from, kind, text: String(body.text || "").slice(0, 4000), audio_file: audioFile, at: new Date().toISOString() });
+      if (kind === "result") logResult(fromId, body.text || "");
+      return sendJson(res, 200, { ok: true, id });
+    }
+
+    // GET /api/relay/inbox?who=<pc_id|install_id>&token= -> {messages} (clears queue)
+    if (req.method === "GET" && pathname === "/api/relay/inbox") {
+      const who = String(url.searchParams.get("who") || "").trim();
+      if (!who) return sendJson(res, 400, { error: "who required" });
+      const pairs = loadPairs();
+      const asPc = pairs[safeId(who)];
+      if (asPc) {
+        if (!asPc.install_id || String(url.searchParams.get("token") || "") !== asPc.pc_token) return sendJson(res, 403, { error: "bad pc_token or not paired" });
+      } else {
+        const users = loadUsers();
+        if (!users[who] || !users[who].paired_pc_id) return sendJson(res, 403, { error: "unknown or unpaired install_id" });
+      }
+      const msgs = loadQueue(who);
+      saveQueue(who, []);
+      return sendJson(res, 200, { messages: msgs });
+    }
+
+    // POST /api/relay/file — v1.7.0: file transfer PC<->phone (base64, cap 2 MB)
+    // Saves the file, then pushes a relay message kind=file {file_id, name, size}
+    if (req.method === "POST" && pathname === "/api/relay/file") {
+      const b = await readJsonBody(req, 3 * 1024 * 1024);
+      const fromId = safeId(b.from_id);
+      const to = safeId(b.to);
+      if (!fromId || !to || typeof b.data !== "string" || !b.name) return sendJson(res, 400, { error: "bad file body" });
+      if (b.from === "pc") {
+        const pairs = loadPairs();
+        if (!pairs[fromId] || pairs[fromId].pc_token !== b.token || pairs[fromId].install_id !== to) return sendJson(res, 403, { error: "bad pc_token or not paired" });
+      } else if (b.from === "phone") {
+        const users = loadUsers();
+        if (!users[fromId] || users[fromId].paired_pc_id !== to) return sendJson(res, 403, { error: "phone not paired to this pc" });
+      } else return sendJson(res, 400, { error: "bad from" });
+      const buf = Buffer.from(b.data, "base64");
+      if (!buf.length || buf.length > 2 * 1024 * 1024) return sendJson(res, 400, { error: "file too big (2 MB max)" });
+      const id = crypto.randomBytes(12).toString("hex");
+      const safeName = String(b.name).replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 80);
+      fs.mkdirSync(RELAY_FILE_DIR, { recursive: true });
+      fs.writeFileSync(path.join(RELAY_FILE_DIR, id), buf);
+      pushRelay(to, { from: b.from, kind: "file", text: safeName, file_id: id, size: buf.length });
+      return sendJson(res, 200, { ok: true, id, name: safeName, size: buf.length });
+    }
+    // GET /api/relay/file/<id> — download a relayed file (random id, no auth)
+    if (req.method === "GET" && pathname.startsWith("/api/relay/file/")) {
+      const id = safeFileName(pathname.slice("/api/relay/file/".length));
+      const file = path.join(RELAY_FILE_DIR, id);
+      if (!fs.existsSync(file)) return sendJson(res, 404, { error: "no such file" });
+      res.writeHead(200, { "Content-Type": "application/octet-stream" });
+      return fs.createReadStream(file).pipe(res);
+    }
+
+    // GET /api/relay/audio/<id>.wav — voice note file (random id, unguessable)
+    if (req.method === "GET" && pathname.startsWith("/api/relay/audio/")) {
+      const id = pathname.split("/").pop().replace(/[^A-Za-z0-9_-]/g, "");
+      const f = path.join(VOICE_DIR, id + ".wav");
+      if (!fs.existsSync(f)) return sendJson(res, 404, { error: "no such audio" });
+      res.writeHead(200, { "Content-Type": "audio/wav", "Access-Control-Allow-Origin": "*" });
+      return fs.createReadStream(f).pipe(res);
+    }
+
+    // POST /api/pc/screen {pc_id, token, image} — PC uploads its screenshot for the phone
+    if (req.method === "POST" && pathname === "/api/pc/screen") {
+      const body = await readJsonBody(req);
+      const pcId = safeId(body.pc_id);
+      const pairs = loadPairs();
+      const p = pairs[pcId];
+      if (!p || !p.install_id || String(body.token || "") !== p.pc_token) return sendJson(res, 403, { error: "bad pc_token or not paired" });
+      const image = String(body.image || "");
+      if (!image || !/^[A-Za-z0-9+/=]+$/.test(image)) return sendJson(res, 400, { error: "image must be base64" });
+      fs.mkdirSync(PC_SCREEN_DIR, { recursive: true });
+      fs.writeFileSync(path.join(PC_SCREEN_DIR, pcId + ".jpg"), Buffer.from(image, "base64"));
+      p.last_seen = new Date().toISOString();
+      savePairs(pairs);
+      return sendJson(res, 200, { ok: true });
+    }
+
+    // GET /api/phone/screen?pc_id=&token= — PC fetches the paired phone's latest screenshot
+    if (req.method === "GET" && pathname === "/api/phone/screen") {
+      const pcId = safeId(url.searchParams.get("pc_id"));
+      const pairs = loadPairs();
+      const p = pairs[pcId];
+      if (!p || !p.install_id || String(url.searchParams.get("token") || "") !== p.pc_token) return sendJson(res, 403, { error: "bad pc_token or not paired" });
+      const f = path.join(SHOTS_DIR, safeFileName(p.install_id) + ".jpg");
+      if (!fs.existsSync(f)) return sendJson(res, 404, { error: "no phone screenshot yet" });
+      return sendJson(res, 200, { image: fs.readFileSync(f).toString("base64"), at: fs.statSync(f).mtime.toISOString() });
+    }
+
+    // GET /api/pc/pair-info?pc_id=&token= — PC (or voice page) asks who it is paired to
+    if (req.method === "GET" && pathname === "/api/pc/pair-info") {
+      const pcId = safeId(url.searchParams.get("pc_id"));
+      const pairs = loadPairs();
+      const p = pairs[pcId];
+      if (!p || !p.install_id || String(url.searchParams.get("token") || "") !== p.pc_token) return sendJson(res, 403, { error: "bad pc_token or not paired" });
+      return sendJson(res, 200, { install_id: p.install_id, pc_name: p.pc_name || "" });
+    }
+
+    // GET /api/pc/screen?install_id= — phone fetches the paired PC's latest screenshot
+    if (req.method === "GET" && pathname === "/api/pc/screen") {
+      const installId = String(url.searchParams.get("install_id") || "").trim();
+      const users = loadUsers();
+      const u = users[installId];
+      if (!u || !u.paired_pc_id) return sendJson(res, 403, { error: "phone is not paired to a PC" });
+      const f = path.join(PC_SCREEN_DIR, safeId(u.paired_pc_id) + ".jpg");
+      if (!fs.existsSync(f)) return sendJson(res, 404, { error: "no PC screenshot yet" });
+      return sendJson(res, 200, { image: fs.readFileSync(f).toString("base64"), at: fs.statSync(f).mtime.toISOString() });
     }
 
     // ---- POST /api/event
@@ -1050,6 +1361,16 @@ const server = http.createServer(async (req, res) => {
       const users = loadUsers();
       const devices = loadDevices();
       return sendJson(res, 200, Object.values(users).map((u) => publicUser(u, devices)));
+    }
+
+    // ---- GET /api/admin/pairs?key= (dashboard: list PC pairings)
+    if (req.method === "GET" && pathname === "/api/admin/pairs") {
+      if (url.searchParams.get("key") !== ADMIN_KEY) return sendJson(res, 403, { error: "bad key" });
+      const pairs = loadPairs();
+      return sendJson(res, 200, Object.values(pairs).map((p) => ({
+        pc_id: p.pc_id, pc_name: p.pc_name || "", os: p.os || "",
+        install_id: p.install_id || null, created_at: p.created_at || "", last_seen: p.last_seen || "",
+      })));
     }
 
     // ---- GET /api/admin/config
@@ -1255,6 +1576,251 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, publicUser(user, devices));
     }
 
+    // ---- GET /pc-voice (PC live voice call page — Agora Web SDK, no install)
+    // Opened from the PC app with ?pc_id=&token= ; the page fetches its pair
+    // info + an Agora token, then joins jarvis-voice-<install_id> with the mic.
+    // The phone joins the same channel (uid 2002) when the PC asks via relay.
+    if (req.method === "GET" && pathname === "/pc-voice") {
+      const html = '<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>JARVIS PC — Live Voice</title>'
+        + '<style>body{background:#0b1220;color:#e2e8f0;font-family:system-ui,sans-serif;text-align:center;padding:24px}h1{color:#22d3ee}button{font-size:18px;padding:12px 28px;border-radius:10px;border:0;background:#22d3ee;color:#082f49;cursor:pointer;margin:6px}.muted{color:#94a3b8}#status{font-size:18px;margin:18px 0}</style>'
+        + '<script src="https://download.agora.io/sdk/release/AgoraRTC_N.js"></script></head><body>'
+        + '<h1>🎙️ JARVIS — Live Voice Call</h1><p class="muted">PC ↔ Phone — real-time voice, du dikei shona jabe.</p>'
+        + '<div id="status">Connecting…</div>'
+        + '<div><button id="muteBtn" onclick="toggleMute()">🔇 Mute</button>'
+        + '<button onclick="leaveCall()">📞 End call</button></div>'
+        + '<p class="muted">Call cholakalin phone-er always-on listening pause thakbe — call sesh hole abar chalu hobe.</p>'
+        + '<script>'
+        + 'var qs = new URLSearchParams(location.search);'
+        + 'var pcId = qs.get("pc_id") || ""; var token = qs.get("token") || "";'
+        + 'var client = null, micTrack = null, muted = false, installId = "";'
+        + 'function setStatus(s) { document.getElementById("status").textContent = s; }'
+        + 'async function joinCall() {'
+        + '  try {'
+        + '    var r = await fetch("/api/pc/pair-info?pc_id=" + encodeURIComponent(pcId) + "&token=" + encodeURIComponent(token));'
+        + '    var j = await r.json();'
+        + '    if (!r.ok || !j.install_id) { setStatus("Pair hoy ni — age PC app theke QR scan kore pair koro."); return; }'
+        + '    installId = j.install_id;'
+        + '    // channel token thekei ase ("jarvis-<install_id>") — phone uid 2002 diye ekoi channel-e join kore.'
+        + '    var r2 = await fetch("/api/agora-token?install_id=" + encodeURIComponent(installId) + "&uid=2001");'
+        + '    var t2 = await r2.json();'
+        + '    if (!r2.ok || !t2.token) { setStatus("Agora token pelam na — backend-e AGORA_APP_ID / AGORA_APP_CERTIFICATE ache kina dekho."); return; }'
+        + '    client = AgoraRTC.createClient({ mode: "rtc", codec: "vp8" });'
+        + '    client.on("user-published", async function(user, mediaType) {'
+        + '      await client.subscribe(user, mediaType);'
+        + '      if (mediaType === "audio") { user.audioTrack.play(); setStatus("🎙️ Live — phone connected, kotha bolo!"); }'
+        + '    });'
+        + '    client.on("user-unpublished", function() { setStatus("📱 Phone call theke beriye geche."); });'
+        + '    await client.join(t2.appId, t2.channel, t2.token, 2001);'
+        + '    micTrack = await AgoraRTC.createMicrophoneAudioTrack();'
+        + '    await client.publish(micTrack);'
+        + '    setStatus("🎙️ Live — mic on. Phone join korlei du dike kotha shona jabe…");'
+        + '    await fetch("/api/relay/send", { method: "POST", headers: { "Content-Type": "application/json" },'
+        + '      body: JSON.stringify({ from: "pc", from_id: pcId, to: installId, kind: "voice_call", text: "live voice call", token: token }) });'
+        + '  } catch (e) { setStatus("Call join hoy ni: " + e.message); }'
+        + '}'
+        + 'async function toggleMute() {'
+        + '  if (!micTrack) return;'
+        + '  muted = !muted; await micTrack.setMuted(muted);'
+        + '  document.getElementById("muteBtn").textContent = muted ? "🔊 Unmute" : "🔇 Mute";'
+        + '}'
+        + 'async function leaveCall() {'
+        + '  try {'
+        + '    if (installId) await fetch("/api/relay/send", { method: "POST", headers: { "Content-Type": "application/json" },'
+        + '      body: JSON.stringify({ from: "pc", from_id: pcId, to: installId, kind: "voice_end", text: "call ended", token: token }) });'
+        + '  } catch (e) {}'
+        + '  try { if (micTrack) micTrack.close(); if (client) await client.leave(); } catch (e) {}'
+        + '  setStatus("Call sesh. Window-ta bondho kore dite paro.");'
+        + '}'
+        + 'window.addEventListener("beforeunload", function() { leaveCall(); });'
+        + 'joinCall();'
+        + '</script></body></html>';
+      return sendHtml(res, 200, html);
+    }
+
+    // ---- v1.7.0: /remote — QR scan kore browser theke control (app lagbe na) ----
+    // Auth: install_id + remote_token (phone v1.7.0-te register kore) BA admin key.
+    // Page-e device list (phone + paired PC, online status) + command box + results.
+    // Jekono internet-e cholbe — mobile data / Wi-Fi, same network lagbe na.
+    function remoteAuth(u) {
+      const id = safeId(u.searchParams.get("install_id"));
+      const tok = String(u.searchParams.get("token") || "");
+      if (!id || !tok) return null;
+      if (tok === ADMIN_KEY) return id;
+      const users = loadUsers();
+      if (users[id] && users[id].remote_token && users[id].remote_token === tok) return id;
+      return null;
+    }
+    // GET /api/remote/installs?token=ADMIN_KEY — dashboard theke device picker
+    if (req.method === "GET" && pathname === "/api/remote/installs") {
+      if (String(url.searchParams.get("token") || "") !== ADMIN_KEY) return sendJson(res, 401, { error: "unauthorized" });
+      const users = loadUsers();
+      const out = Object.keys(users).map(function(id) {
+        const u = users[id];
+        return { install_id: id, model: u.device_model || "", app_version: u.app_version || "", online: u.last_seen ? (Date.now() - new Date(u.last_seen).getTime() < 16 * 60 * 1000) : false };
+      });
+      return sendJson(res, 200, { installs: out });
+    }
+    // GET /api/remote/devices?install_id=&token= — phone + paired PC, online status
+    if (req.method === "GET" && pathname === "/api/remote/devices") {
+      const id = remoteAuth(url);
+      if (!id) return sendJson(res, 401, { error: "unauthorized" });
+      const users = loadUsers();
+      const pairs = loadPairs();
+      const u = users[id] || {};
+      const phoneOnline = u.last_seen ? (Date.now() - new Date(u.last_seen).getTime() < 16 * 60 * 1000) : false;
+      const pcs = [];
+      Object.keys(pairs).forEach(function(pcId) {
+        const pr = pairs[pcId];
+        if (pr.install_id === id) pcs.push({ pc_id: pcId, pc_name: pr.pc_name || pcId, os: pr.os || "", online: pr.last_seen ? (Date.now() - new Date(pr.last_seen).getTime() < 2 * 60 * 1000) : false, last_seen: pr.last_seen || null });
+      });
+      return sendJson(res, 200, { phone: { install_id: id, model: u.device_model || "", app_version: u.app_version || "", online: phoneOnline, last_seen: u.last_seen || null }, pcs });
+    }
+    // POST /api/remote/send {install_id, token, target:"phone"|"pc", text} — command pathao
+    if (req.method === "POST" && pathname === "/api/remote/send") {
+      const b = await readJsonBody(req);
+      const id = remoteAuth(new URL("http://x/?install_id=" + encodeURIComponent(b.install_id || "") + "&token=" + encodeURIComponent(b.token || "")));
+      if (!id) return sendJson(res, 401, { error: "unauthorized" });
+      const target = String(b.target || "phone");
+      const text = String(b.text || "").slice(0, 4000);
+      if (!text) return sendJson(res, 400, { error: "text required" });
+      let to = id;
+      if (target === "pc") {
+        const users = loadUsers();
+        if (!users[id] || !users[id].paired_pc_id) return sendJson(res, 400, { error: "no PC paired to this phone" });
+        to = users[id].paired_pc_id;
+      }
+      const mid = crypto.randomBytes(8).toString("hex");
+      pushRelay(to, { id: mid, from: "remote", kind: "text", text, audio_file: "", at: new Date().toISOString() });
+      return sendJson(res, 200, { ok: true, id: mid, to: target });
+    }
+    // GET /api/remote/results?install_id=&token= — phone + PC-r recent replies
+    if (req.method === "GET" && pathname === "/api/remote/results") {
+      const id = remoteAuth(url);
+      if (!id) return sendJson(res, 401, { error: "unauthorized" });
+      const users = loadUsers();
+      const out = { phone: loadResults(id), pc: [] };
+      if (users[id] && users[id].paired_pc_id) out.pc = loadResults(users[id].paired_pc_id);
+      return sendJson(res, 200, out);
+    }
+    // GET /remote — browser remote-control page (QR scan kore khule)
+    if (req.method === "GET" && pathname === "/remote") {
+      const html = '<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>JARVIS Remote</title>'
+        + '<style>body{background:#0b1220;color:#e2e8f0;font-family:system-ui,sans-serif;padding:16px;max-width:640px;margin:auto}h1{color:#22d3ee}button{font-size:15px;padding:10px 14px;border-radius:10px;border:0;background:#22d3ee;color:#082f49;cursor:pointer;margin:4px}input,select{font-size:16px;padding:10px;border-radius:8px;border:1px solid #334155;background:#1e293b;color:#e2e8f0;width:100%;box-sizing:border-box}.card{background:#1e293b;border-radius:12px;padding:12px;margin:10px 0}.on{color:#4ade80}.off{color:#f87171}.res{white-space:pre-wrap;background:#0f172a;border-radius:8px;padding:10px;margin:6px 0;font-size:14px}</style></head><body>'
+        + '<h1>🤖 JARVIS Remote</h1><p>QR scan kore khulle — app lagbe na. Jekono internet-e cholbe (mobile data / Wi-Fi, same network lagbe na).</p>'
+        + '<div class="card"><b>Device</b><br><select id="installSel" onchange="pickInstall()"></select><div id="devices">Loading…</div></div>'
+        + '<div class="card"><label>Target</label><br><select id="target"><option value="phone">📱 Phone</option><option value="pc">💻 PC</option></select><br><br>'
+        + '<input id="cmd" placeholder="Command likho — e.g. find my phone, take a screenshot, open WhatsApp"><br><br>'
+        + '<button onclick="sendCmd()">▶ Send</button>'
+        + '<button onclick="quick(\'find my phone\')">🔍 Find phone</button>'
+        + '<button onclick="quick(\'where is my phone\')">📍 Location</button>'
+        + '<button onclick="quick(\'take a screenshot\')">📸 Screenshot</button>'
+        + '<button onclick="quick(\'shutdown\')">⏻ PC off</button></div>'
+        + '<div class="card"><b>Replies</b><div id="results"></div></div>'
+        + '<script>'
+        + 'var qs = new URLSearchParams(location.search);'
+        + 'var installId = qs.get("install_id") || ""; var token = qs.get("token") || "";'
+        + 'async function loadInstalls() {'
+        + '  var sel = document.getElementById("installSel");'
+        + '  if (installId) { sel.innerHTML = "<option value=\\"" + installId + "\\">" + installId.slice(0, 12) + "…</option>"; return; }'
+        + '  try { var r = await fetch("/api/remote/installs?token=" + encodeURIComponent(token));'
+        + '  var j = await r.json(); if (!r.ok) return;'
+        + '  sel.innerHTML = "";'
+        + '  (j.installs || []).forEach(function(u) { var o = document.createElement("option"); o.value = u.install_id; o.textContent = (u.model || u.install_id.slice(0, 12)) + " v" + (u.app_version || "?") + (u.online ? " ●" : " ○"); sel.appendChild(o); });'
+        + '  if (sel.options.length) { installId = sel.value; loadDevices(); loadResults(); } } catch (e) {}'
+        + '}'
+        + 'function pickInstall() { installId = document.getElementById("installSel").value; loadDevices(); loadResults(); }'
+        + 'async function loadDevices() {'
+        + '  if (!installId) return;'
+        + '  try { var r = await fetch("/api/remote/devices?install_id=" + encodeURIComponent(installId) + "&token=" + encodeURIComponent(token));'
+        + '  var j = await r.json();'
+        + '  if (!r.ok) { document.getElementById("devices").innerHTML = "Auth hoy ni — QR-ta abar scan koro."; return; }'
+        + '  var h = "📱 Phone " + (j.phone.model || "") + " v" + (j.phone.app_version || "?") + " — " + (j.phone.online ? "<span class=\\"on\\">● Online</span>" : "<span class=\\"off\\">○ Offline</span>");'
+        + '  j.pcs.forEach(function(p) { h += "<br>💻 " + p.pc_name + " (" + (p.os || "") + ") — " + (p.online ? "<span class=\\"on\\">● Online</span>" : "<span class=\\"off\\">○ Offline</span>"); });'
+        + '  if (!j.pcs.length) h += "<br><span>💻 Kono PC pair hoy ni ekhono.</span>";'
+        + '  document.getElementById("devices").innerHTML = h; } catch (e) {}'
+        + '}'
+        + 'async function sendCmd() { var t = document.getElementById("cmd").value.trim(); if (!t) return; document.getElementById("cmd").value = ""; await sendText(t); }'
+        + 'async function quick(t) { await sendText(t); }'
+        + 'async function sendText(t) {'
+        + '  if (!installId) return;'
+        + '  var tg = document.getElementById("target").value;'
+        + '  await fetch("/api/remote/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ install_id: installId, token: token, target: tg, text: t }) });'
+        + '  setTimeout(loadResults, 1500);'
+        + '}'
+        + 'async function loadResults() {'
+        + '  if (!installId) return;'
+        + '  try { var r = await fetch("/api/remote/results?install_id=" + encodeURIComponent(installId) + "&token=" + encodeURIComponent(token));'
+        + '  var j = await r.json(); if (!r.ok) return;'
+        + '  var all = [];'
+        + '  (j.phone || []).forEach(function(x) { all.push("📱 " + x.text); });'
+        + '  (j.pc || []).forEach(function(x) { all.push("💻 " + x.text); });'
+        + '  var h = ""; all.slice(-10).forEach(function(s) { h += "<div class=\\"res\\">" + s.replace(/</g, "&lt;") + "</div>"; });'
+        + '  document.getElementById("results").innerHTML = h || "<p>No replies yet.</p>"; } catch (e) {}'
+        + '}'
+        + 'loadInstalls(); loadDevices(); loadResults(); setInterval(function() { loadDevices(); loadResults(); }, 3000);'
+        + '</script></body></html>';
+      return sendHtml(res, 200, html);
+    }
+
+    // ---- v1.7.0: Telegram bot control ----
+    // Setup: @BotFather-e bot banao -> token Render env TELEGRAM_BOT_TOKEN-e dao.
+    // Bot-ke /start korle se chat id dekhabe; dashboard-e Telegram section-e chat id
+    // add korle bot sudhu oi chat-ei kotha bolbe. /devices = connected devices,
+    // /phone <cmd> / /pc <cmd> = command pathao; reply result hisebe fire asbe.
+    if (req.method === "POST" && pathname === "/api/telegram/webhook") {
+      const update = await readJsonBody(req, 1024 * 1024);
+      const msg = update.message || update.edited_message || null;
+      if (msg && msg.text && TELEGRAM_BOT_TOKEN) {
+        const chatId = msg.chat.id;
+        const cfg = loadConfig();
+        const allowed = Array.isArray(cfg.telegram_chats) ? cfg.telegram_chats : [];
+        const text = String(msg.text).trim();
+        if (text === "/start") {
+          tgSend(chatId, "🤖 JARVIS Bot — tomar chat id: " + chatId + "\nDashboard-e (Remote control > Telegram) ei chat id-ta add koro, tarpor /devices likho.");
+        } else if (allowed.indexOf(String(chatId)) < 0) {
+          tgSend(chatId, "⛔ Ei bot-ta sudhu owner-er jonno. Age /start kore chat id dashboard-e add koro.");
+        } else if (text === "/devices") {
+          const users = loadUsers();
+          const pairs = loadPairs();
+          const lines = ["📱 Connected devices:"];
+          Object.keys(users).forEach(function(id) {
+            const u = users[id];
+            const on = u.last_seen ? (Date.now() - new Date(u.last_seen).getTime() < 16 * 60 * 1000) : false;
+            lines.push((on ? "🟢" : "⚪") + " Phone " + (u.device_model || id.slice(0, 8)) + " v" + (u.app_version || "?") + " — /phone <command>");
+            if (u.paired_pc_id) {
+              const pr = pairs[u.paired_pc_id] || {};
+              const pcOn = pr.last_seen ? (Date.now() - new Date(pr.last_seen).getTime() < 2 * 60 * 1000) : false;
+              lines.push((pcOn ? "🟢" : "⚪") + " PC " + (pr.pc_name || u.paired_pc_id) + " — /pc <command>");
+            }
+          });
+          lines.push("\nExample: /phone find my phone");
+          tgSend(chatId, lines.join("\n"));
+        } else if (text.startsWith("/phone ") || text.startsWith("/pc ")) {
+          const target = text.startsWith("/phone ") ? "phone" : "pc";
+          const cmd = text.slice(target === "phone" ? 7 : 4).trim();
+          const users = loadUsers();
+          const ids = Object.keys(users);
+          if (!ids.length) { tgSend(chatId, "Kono phone connect hoy ni ekhono."); }
+          else {
+            const id = ids[0];
+            let to = id;
+            if (target === "pc") {
+              if (!users[id].paired_pc_id) { tgSend(chatId, "Ei phone-er sathe kono PC pair hoy ni."); }
+              else to = users[id].paired_pc_id;
+            }
+            if (to) {
+              const mid = crypto.randomBytes(8).toString("hex");
+              pushRelay(to, { id: mid, from: "telegram", kind: "text", text: cmd, audio_file: "", at: new Date().toISOString() });
+              tgSend(chatId, "⏳ " + (target === "phone" ? "📱 Phone" : "💻 PC") + "-ke pathalam: " + cmd + "\nReply ele ekhanei asbe.");
+            }
+          }
+        } else {
+          tgSend(chatId, "Commands: /devices — connected devices dekho\n/phone <command> — phone-ke command\n/pc <command> — PC-ke command");
+        }
+      }
+      return sendJson(res, 200, { ok: true });
+    }
+
     // ---- GET /admin (dashboard)
     if (req.method === "GET" && pathname === "/admin") {
       const key = url.searchParams.get("key") || "";
@@ -1278,6 +1844,28 @@ const server = http.createServer(async (req, res) => {
     res.end();
   }
 });
+
+// v1.7.0: Telegram — notun result ele allowed chat-e pathiye dao (10 sec-e check)
+let tgLastSent = {};
+setInterval(() => {
+  if (!TELEGRAM_BOT_TOKEN) return;
+  try {
+    const cfg = loadConfig();
+    const allowed = Array.isArray(cfg.telegram_chats) ? cfg.telegram_chats : [];
+    if (!allowed.length) return;
+    fs.mkdirSync(RESULTS_DIR, { recursive: true });
+    fs.readdirSync(RESULTS_DIR).forEach((f) => {
+      const id = f.replace(/\.json$/, "");
+      const arr = loadResults(id);
+      const last = arr[arr.length - 1];
+      if (!last) return;
+      const key = id + ":" + last.at + ":" + last.text;
+      if (tgLastSent[id] === key) return;
+      tgLastSent[id] = key;
+      allowed.forEach((c) => tgSend(c, "✅ Result (" + id.slice(0, 8) + "):\n" + last.text));
+    });
+  } catch (e) {}
+}, 10000);
 
 server.listen(PORT, () => {
   console.log("JARVIS backend v2 listening on port " + PORT);
