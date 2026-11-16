@@ -932,6 +932,13 @@ const server = http.createServer(async (req, res) => {
       if (existing && existing.install_id) {
         return sendJson(res, 200, { paired: true, install_id: existing.install_id, pc_name: existing.pc_name || "" });
       }
+      // v1.8.1 FIX: unexpired code thakle SETAI firao — prottek request-e notun code
+      // banale PC-r QR 4 second por por bodle jeto ar phone scan kore confirm korte parto na.
+      if (existing && existing.pair_code && existing.code_expires && existing.code_expires > Date.now()) {
+        existing.last_seen = new Date().toISOString();
+        savePairs(pairs);
+        return sendJson(res, 200, { paired: false, pair_code: existing.pair_code, expires_in: Math.ceil((existing.code_expires - Date.now()) / 1000) });
+      }
       const code = String(100000 + Math.floor(Math.random() * 900000));
       pairs[pcId] = {
         pc_id: pcId,
