@@ -151,7 +151,10 @@ function publicUser(user, devices) {
 }
 
 // ---- Agora RTC token (AccessToken2, "007") — pure Node crypto, no deps.
-// token = "007" + base64(packBytes(sig) + packU32(crcCh) + packU32(crcUid) + packBytes(msg))
+// token = "007" + base64(sig + packU32(crcCh) + packU32(crcUid) + msg)
+//   — NO length prefixes: sig and msg go in RAW (v1.4.9 bug: packBytes() added a
+//   U16 length before sig and msg, so Agora could not parse the token and
+//   joinChannel failed with CAN_NOT_GET_GATEWAY_SERVER "can not find appid").
 // msg = packU32(salt) + packU32(ts) + packMapU32({1: ts})   (1 = kJoinChannel)
 // sig = HMAC-SHA256(appCertificate, appId + channel + uidStr + msg)
 const CRC_TABLE = (() => {
@@ -184,7 +187,7 @@ function buildAgoraToken(appId, appCertificate, channel, uid) {
   const sig = crypto.createHmac("sha256", appCertificate)
     .update(Buffer.concat([Buffer.from(appId, "utf8"), Buffer.from(channel, "utf8"), Buffer.from(uidStr, "utf8"), msg]))
     .digest();
-  const content = Buffer.concat([packBytes(sig), packU32(crc32(Buffer.from(channel, "utf8"))), packU32(crc32(Buffer.from(uidStr, "utf8"))), packBytes(msg)]);
+  const content = Buffer.concat([sig, packU32(crc32(Buffer.from(channel, "utf8"))), packU32(crc32(Buffer.from(uidStr, "utf8"))), msg]);
   return "007" + content.toString("base64");
 }
 
