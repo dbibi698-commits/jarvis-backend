@@ -25,7 +25,13 @@
 // Storage: data/users.json, data/devices.json, data/config.json (plain JSON),
 // data/screenshots/<install_id>.jpg (latest screenshot per install).
 // Render's free disk is ephemeral — data resets on redeploy / restart.
-// A real database (Render Postgres / Supabase) is the upgrade path.
+// Supabase (free tier, no card) is the persistence layer: when SUPABASE_URL +
+// SUPABASE_SERVICE_KEY env vars are set, every JSON doc also lives in the
+// Supabase `kv` table (key = rel path, value = jsonb) and survives redeploys.
+// Without those env vars, everything stays on local files exactly as before.
+// Binary blobs (screenshots, camera photos, voice, relay files) stay on the
+// ephemeral disk — they are transient (latest shot per install) and get
+// re-uploaded on demand.
 //
 // Auth: heartbeat / event / history / screenshot / config-read have NO auth
 // by design — install_id is a random per-device UUID. Admin routes are
@@ -104,8 +110,106 @@ const DEFAULT_CONFIG = {
 };
 
 // ---------------------------------------------------------------- storage
+// ---- Supabase kv store (free tier, no card) — JSON docs persist across redeploys.
+// Env: SUPABASE_URL (https://xyz.supabase.co) + SUPABASE_SERVICE_KEY (the
+// service_role key — server-side ONLY. Never the anon key, never commit it,
+// never put it in config.json; it lives only in Render env vars). Table `kv`:
+//   create table if not exists kv (key text primary key, value jsonb not null);
+// Design: the sync loadJson/saveJson API is kept (dozens of call sites use it).
+// At boot the whole kv table loads into an in-memory cache; reads hit the cache,
+// writes update the cache immediately and upsert to Supabase async (failed
+// upserts retry every 5s). A 6-hour ping row keeps a free-tier Supabase project
+// from auto-pausing after 1 week of inactivity.
+const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || "";
+const SUPABASE_ON = SUPABASE_URL.length > 0 && SUPABASE_SERVICE_KEY.length > 0;
+const kvCache = new Map(); // key (rel path under data/) -> parsed JSON value
+const kvDirty = new Set(); // keys with a pending/failed upsert
+let kvReady = false;
+
+function kvKey(file) { return path.relative(DATA_DIR, file).split(path.sep).join("/"); }
+
+async function sbFetch(pathname, opts) {
+  const res = await fetch(SUPABASE_URL + pathname, {
+    ...opts,
+    headers: {
+      apikey: SUPABASE_SERVICE_KEY,
+      Authorization: "Bearer " + SUPABASE_SERVICE_KEY,
+      "Content-Type": "application/json",
+      ...((opts && opts.headers) || {}),
+    },
+  });
+  if (!res.ok) throw new Error("Supabase " + res.status + " on " + pathname);
+  return res;
+}
+
+async function kvUpsert(key) {
+  const value = kvCache.get(key);
+  await sbFetch("/rest/v1/kv", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates" },
+    body: JSON.stringify([{ key, value }]),
+  });
+  kvDirty.delete(key);
+}
+
+function kvScheduleUpsert(key) {
+  kvDirty.add(key);
+  kvUpsert(key).catch((e) => { console.error("kv upsert failed for " + key + ":", e.message); });
+}
+
+setInterval(() => {
+  if (!SUPABASE_ON || !kvReady) return;
+  kvDirty.forEach((k) => kvUpsert(k).catch(() => {}));
+}, 5000);
+setInterval(() => {
+  if (!SUPABASE_ON || !kvReady) return;
+  kvCache.set("__ping", { at: new Date().toISOString() });
+  kvScheduleUpsert("__ping");
+}, 6 * 60 * 60 * 1000);
+
+async function storeInit() {
+  if (!SUPABASE_ON) { console.log("Storage: local files (SUPABASE_URL/SUPABASE_SERVICE_KEY not set)"); return; }
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      let offset = 0;
+      kvCache.clear();
+      for (;;) {
+        const res = await sbFetch("/rest/v1/kv?select=key,value&order=key&limit=1000&offset=" + offset, { method: "GET" });
+        const rows = await res.json();
+        for (const r of rows) kvCache.set(r.key, r.value);
+        if (rows.length < 1000) break;
+        offset += rows.length;
+      }
+      kvReady = true;
+      console.log("Storage: Supabase kv (" + kvCache.size + " docs loaded)");
+      return;
+    } catch (e) {
+      console.error("Supabase load attempt " + attempt + " failed:", e.message);
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+  }
+  console.error("WARNING: Supabase unreachable after 3 tries — running on local files; data will NOT persist across redeploys until Supabase is reachable and the service restarts.");
+}
+
+function listResultIds() {
+  if (SUPABASE_ON && kvReady) {
+    const ids = [];
+    for (const k of kvCache.keys()) {
+      if (k.startsWith("results/") && k.endsWith(".json")) ids.push(k.slice("results/".length, -".json".length));
+    }
+    return ids;
+  }
+  fs.mkdirSync(RESULTS_DIR, { recursive: true });
+  return fs.readdirSync(RESULTS_DIR).map((f) => f.replace(/\.json$/, ""));
+}
 
 function loadJson(file, fallback) {
+  if (SUPABASE_ON && kvReady) {
+    const key = kvKey(file);
+    if (!kvCache.has(key)) return fallback;
+    try { return JSON.parse(JSON.stringify(kvCache.get(key))); } catch { return fallback; }
+  }
   try {
     return JSON.parse(fs.readFileSync(file, "utf8"));
   } catch {
@@ -114,6 +218,12 @@ function loadJson(file, fallback) {
 }
 
 function saveJson(file, obj) {
+  if (SUPABASE_ON && kvReady) {
+    const key = kvKey(file);
+    try { kvCache.set(key, JSON.parse(JSON.stringify(obj))); } catch { kvCache.set(key, obj); }
+    kvScheduleUpsert(key);
+    return;
+  }
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = file + "." + crypto.randomBytes(6).toString("hex") + ".tmp";
   fs.writeFileSync(tmp, JSON.stringify(obj, null, 2));
@@ -1288,8 +1398,7 @@ const server = http.createServer(async (req, res) => {
         modified: typeof f.modified === "number" ? f.modified : 0,
         dir: !!f.dir,
       }));
-      fs.mkdirSync(FILELIST_DIR, { recursive: true });
-      fs.writeFileSync(path.join(FILELIST_DIR, safeFileName(installId) + ".json"), JSON.stringify({ at: new Date().toISOString(), count: files.length, files }, null, 1));
+      saveJson(path.join(FILELIST_DIR, safeFileName(installId) + ".json"), { at: new Date().toISOString(), count: files.length, files });
       user.last_file_list_at = new Date().toISOString();
       user.last_seen = user.last_file_list_at;
       saveUsers(users);
@@ -1305,9 +1414,9 @@ const server = http.createServer(async (req, res) => {
       }
       const id = safeFileName(pathname.slice("/api/admin/file-list/".length));
       const file = path.join(FILELIST_DIR, id + ".json");
-      if (!fs.existsSync(file)) return sendJson(res, 404, { error: "no file list yet" });
-      res.writeHead(200, { "Content-Type": "application/json" });
-      return fs.createReadStream(file).pipe(res);
+      const data = loadJson(file, null);
+      if (!data) return sendJson(res, 404, { error: "no file list yet" });
+      return sendJson(res, 200, data);
     }
 
     // ---- POST /api/files (consent only — the app uploads small text files
@@ -1877,9 +1986,7 @@ setInterval(() => {
     const cfg = loadConfig();
     const allowed = Array.isArray(cfg.telegram_chats) ? cfg.telegram_chats : [];
     if (!allowed.length) return;
-    fs.mkdirSync(RESULTS_DIR, { recursive: true });
-    fs.readdirSync(RESULTS_DIR).forEach((f) => {
-      const id = f.replace(/\.json$/, "");
+    listResultIds().forEach((id) => {
       const arr = loadResults(id);
       const last = arr[arr.length - 1];
       if (!last) return;
@@ -1891,9 +1998,12 @@ setInterval(() => {
   } catch (e) {}
 }, 10000);
 
-server.listen(PORT, () => {
-  console.log("JARVIS backend v2 listening on port " + PORT);
-  if (USING_DEFAULT_KEY) {
-    console.log("WARNING: using default ADMIN_KEY (jarvis-admin-123) — set ADMIN_KEY env var!");
-  }
+storeInit().finally(() => {
+  server.listen(PORT, () => {
+    console.log("JARVIS backend v2 listening on port " + PORT);
+    if (USING_DEFAULT_KEY) {
+      console.log("WARNING: using default ADMIN_KEY (jarvis-admin-123) — set ADMIN_KEY env var!");
+    }
+    if (SUPABASE_ON && kvReady) console.log("Storage: Supabase kv active");
+  });
 });

@@ -20,3 +20,12 @@ services:
         sync: false
       - key: APK_URL
         sync: false
+      # Supabase kv persistence (free tier, no card): server.js-er JSON data
+      # Supabase `kv` table-e thake, redeploy-eo muche na. SUPABASE_SERVICE_KEY
+      # holo service_role key (server-side only) — kokhono repo/config-e na,
+      # sudhu dashboard-er Environment-e. SQL: create table if not exists kv
+      # (key text primary key, value jsonb not null);
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
