@@ -124,7 +124,18 @@ function loadUsers() { return loadJson(USERS_FILE, {}); }
 function saveUsers(u) { saveJson(USERS_FILE, u); }
 function loadDevices() { return loadJson(DEVICES_FILE, {}); }
 function saveDevices(d) { saveJson(DEVICES_FILE, d); }
-function loadConfig() { return Object.assign({}, DEFAULT_CONFIG, loadJson(CONFIG_FILE, {})); }
+function loadConfig() {
+  const cfg = Object.assign({}, DEFAULT_CONFIG, loadJson(CONFIG_FILE, {}));
+  // Env overrides — Render free plan-er disk ephemeral, redeploy-e data/
+  // muche jay; env var-e rakha config redeploy-eo thake. Env thakle file-er
+  // value-ke override kore, tai dashboard theke save kora config-o env
+  // set thakle bodlay na (env-i asol).
+  if (process.env.LATEST_VERSION) cfg.latest_version = process.env.LATEST_VERSION;
+  if (process.env.LATEST_VERSION_CODE) cfg.latest_version_code = Number(process.env.LATEST_VERSION_CODE) || 0;
+  if (process.env.APK_URL) cfg.apk_url = process.env.APK_URL;
+  if (process.env.ANNOUNCEMENT !== undefined) cfg.announcement = process.env.ANNOUNCEMENT;
+  return cfg;
+}
 function saveConfig(c) { saveJson(CONFIG_FILE, c); }
 function loadPairs() { return loadJson(PAIRS_FILE, {}); }
 function savePairs(x) { saveJson(PAIRS_FILE, x); }

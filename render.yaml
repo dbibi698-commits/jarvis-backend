@@ -1,6 +1,10 @@
 # Render Blueprint — JARVIS backend
 # Deploy: push this folder to GitHub, then in Render: New > Blueprint > pick the repo.
 # Render will create the service and generate a random ADMIN_KEY automatically.
+# NOTE: plan free — Render persistent disk free plan-e hoy na (paid plan lagbe),
+# tai data/ folder redeploy-e muche jay. Update config tai env var-e rakha hoy
+# (server.js loadConfig env override dekhe): LATEST_VERSION, LATEST_VERSION_CODE,
+# APK_URL — egulo dashboard-er Environment-e set koro, redeploy-eo thakbe.
 services:
   - type: web
     name: jarvis-backend
@@ -10,3 +14,9 @@ services:
     envVars:
       - key: ADMIN_KEY
         generateValue: true
+      - key: LATEST_VERSION
+        sync: false
+      - key: LATEST_VERSION_CODE
+        sync: false
+      - key: APK_URL
+        sync: false
