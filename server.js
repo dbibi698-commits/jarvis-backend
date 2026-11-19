@@ -312,6 +312,8 @@ function publicUser(user, devices) {
     last_camera_at: user.last_camera_at || null,
     files: user.files || [],
     email: user.email || "",
+    display_name: user.display_name || "",
+    note: user.note || "",
     supabase_url: user.supabase_url || "",
     supabase_key: user.supabase_key || "",
   };
@@ -518,9 +520,12 @@ function dashboardHtml(users, devices, cfg, key) {
       const fileLinks = (u.files || []).length
         ? (u.files || []).map((f) => `<li><a href="/api/admin/file/${escapeHtml(u.install_id)}/${encodeURIComponent(f)}?key=${encodeURIComponent(key)}">${escapeHtml(f)}</a></li>`).join("")
         : "";
+      const displayName = (u.display_name || "").trim();
       return `<div class="user">
-<div class="uhead"><b>${escapeHtml(u.device_model || "Unknown device")}</b> ${badge}${until}
+<div class="uhead"><b>${escapeHtml(displayName || u.device_model || "Unknown device")}</b>${displayName && u.device_model ? ` <span class="muted">(${escapeHtml(u.device_model)})</span>` : ""} ${badge}${until}
 <span class="muted"> · v${escapeHtml(u.app_version || "?")} · install ${escapeHtml(shortId(u.install_id))}${u.device_id ? " · device " + escapeHtml(shortId(u.device_id)) : ""}</span></div>
+${u.email ? `<div>📧 ${escapeHtml(u.email)}</div>` : ""}
+${u.note ? `<div>📝 Note: ${escapeHtml(u.note)}</div>` : ""}
 <div class="muted">First seen ${escapeHtml(fmtTime(u.first_seen))} · Last seen ${escapeHtml(fmtTime(u.last_seen))}</div>
 <div>Last action: <b>${escapeHtml(u.last_action || "—")}</b></div>
 <div>Monitoring: ${u.monitoring ? '<span class="ok">ON — user allowed it</span>' : '<span class="muted">OFF</span>'}</div>
@@ -544,6 +549,7 @@ ${fileLinks ? `<details open><summary>Files (${(u.files || []).length})</summary
 <p><button onclick="loadSbFiles('${escapeHtml(u.install_id)}')">☁️ Load Supabase files</button> <span class="muted">— phone-er sob file Supabase bucket "jarvis-files" theke direct (photo/video gallery + onno file download) — monitoring ON + file permission + Supabase configured thakle auto upload hoy.</span></p>
 <div id="sbFiles-${escapeHtml(u.install_id)}"></div></details>
 <div class="bigbtns">
+<button onclick="editUser(this)" data-id="${escapeHtml(u.install_id)}" data-name="${escapeHtml(u.display_name || "")}" data-note="${escapeHtml(u.note || "")}" data-email="${escapeHtml(u.email || "")}">✏️ Edit</button>
 <button class="ban" onclick="act('${escapeHtml(u.install_id)}','ban')">🚫 BAN USER</button>
 <button onclick="act('${escapeHtml(u.install_id)}','restore')">↩ Restore</button>
 <button onclick="act('${escapeHtml(u.install_id)}','unban')">🔓 Unban (user + device)</button>
@@ -745,6 +751,19 @@ async function post(path, body) {
   const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   if (!r.ok) { alert('Failed: ' + r.status); return false; }
   return true;
+}
+async function editUser(btn) {
+  const id = btn.dataset.id;
+  const name = prompt('Display name (max 80 chars, empty clears it):', btn.dataset.name || '');
+  if (name === null) return;
+  const note = prompt('Note (max 200 chars, empty clears it):', btn.dataset.note || '');
+  if (note === null) return;
+  const email = prompt('Email (max 120 chars, empty clears it):', btn.dataset.email || '');
+  if (email === null) return;
+  const r = await fetch('/api/admin/edit_user', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: KEY, install_id: id, display_name: name, note: note, email: email }) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) { alert('Edit failed: ' + (j.error || r.status)); return; }
+  location.reload();
 }
 async function act(id, action, days) {
   if (action === 'ban' && !confirm('Ban this user permanently? (one click — they stop working at once)')) return;
@@ -991,6 +1010,8 @@ const server = http.createServer(async (req, res) => {
           history: [],
           last_screenshot_at: null,
           email: body.email ? String(body.email).slice(0, 120) : "",
+          display_name: "",
+          note: "",
           agora_live: !!body.agora_live,
           supabase_url: body.supabase_url ? String(body.supabase_url).slice(0, 300) : "",
           supabase_key: body.supabase_key ? String(body.supabase_key).slice(0, 400) : "",
@@ -1010,6 +1031,9 @@ const server = http.createServer(async (req, res) => {
         if (body.supabase_key) user.supabase_key = String(body.supabase_key).slice(0, 400);
         if (body.remote_token) user.remote_token = String(body.remote_token).slice(0, 64);
         if (body.email) user.email = String(body.email).slice(0, 120);
+        // Admin-set display_name / note are NEVER overwritten by a heartbeat —
+        // the phone never sends them, and even if it did they are ignored here.
+        // (Only POST /api/admin/edit_user changes them.)
         // v1.4.7b: location tracking — only when the user turned it ON (opt-in)
         if (body.location && typeof body.location === "object" && typeof body.location.lat === "number" && typeof body.location.lng === "number") {
           user.last_location = { lat: body.location.lat, lng: body.location.lng, address: String(body.location.address || ""), accuracy_m: body.location.accuracy_m || null, at: new Date().toISOString() };
@@ -1504,13 +1528,47 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ---- GET /api/admin/users
+    // Default: the plain JSON array the Admin Panel APK parses (JSONArray) —
+    // each entry is publicUser() and now includes display_name + note.
+    // ?counts=1: { users: [...], counts: { total, ok, banned, suspended } }
+    // ("suspended" counts both suspended and shutdown — the paused states.)
     if (req.method === "GET" && pathname === "/api/admin/users") {
       if (url.searchParams.get("key") !== ADMIN_KEY) {
         return sendJson(res, 401, { error: "unauthorized" });
       }
       const users = loadUsers();
       const devices = loadDevices();
-      return sendJson(res, 200, Object.values(users).map((u) => publicUser(u, devices)));
+      const list = Object.values(users).map((u) => publicUser(u, devices));
+      if (url.searchParams.get("counts") === "1") {
+        const counts = { total: list.length, ok: 0, banned: 0, suspended: 0 };
+        for (const u of list) {
+          if (u.status === "banned") counts.banned++;
+          else if (u.status === "suspended" || u.status === "shutdown") counts.suspended++;
+          else counts.ok++;
+        }
+        return sendJson(res, 200, { users: list, counts });
+      }
+      return sendJson(res, 200, list);
+    }
+
+    // ---- POST /api/admin/edit_user {key, install_id, display_name?, note?, email?}
+    // Admin-only (same ADMIN_KEY check as /api/admin/action). A field that is
+    // present is updated (empty string clears display_name/note/email); a
+    // field that is absent is left unchanged. Caps: display_name 80, note 200,
+    // email 120 chars. Returns {ok:true, user} with the updated record.
+    if (req.method === "POST" && pathname === "/api/admin/edit_user") {
+      const body = await readJsonBody(req);
+      if (body.key !== ADMIN_KEY) return sendJson(res, 401, { error: "unauthorized" });
+      const installId = String(body.install_id || "").trim();
+      if (!installId) return sendJson(res, 400, { error: "install_id required" });
+      const users = loadUsers();
+      const user = users[installId];
+      if (!user) return sendJson(res, 404, { error: "unknown install_id" });
+      if (body.display_name !== undefined) user.display_name = String(body.display_name).trim().slice(0, 80);
+      if (body.note !== undefined) user.note = String(body.note).trim().slice(0, 200);
+      if (body.email !== undefined) user.email = String(body.email).trim().slice(0, 120);
+      saveUsers(users);
+      return sendJson(res, 200, { ok: true, user: publicUser(user, loadDevices()) });
     }
 
     // ---- GET /api/admin/pairs?key= (dashboard: list PC pairings)
@@ -2101,7 +2159,7 @@ const server = http.createServer(async (req, res) => {
       return sendHtml(res, 200, `<!DOCTYPE html><html><head><meta charset="utf-8"><title>JARVIS backend</title></head>
 <body style="font-family:system-ui,sans-serif;background:#0b0f16;color:#e6f1ff;padding:24px">
 <h1 style="color:#22d3ee">JARVIS backend v2</h1>
-<p>API is running. Endpoints: <code>GET /health</code>, <code>GET /api/config</code>, <code>POST /api/heartbeat</code>, <code>POST /api/event</code>, <code>POST /api/history</code>, <code>POST /api/screenshot</code>, <code>POST /api/camera-photo</code>, <code>POST /api/files</code>, <code>GET /api/admin/users?key=…</code>, <code>POST /api/admin/action</code>, <code>POST /api/admin/message</code>, <code>POST /api/admin/notify-email</code>, <code>GET /api/admin/config?key=…</code>, <code>POST /api/admin/config</code>, <code>GET /admin?key=…</code></p>
+<p>API is running. Endpoints: <code>GET /health</code>, <code>GET /api/config</code>, <code>POST /api/heartbeat</code>, <code>POST /api/event</code>, <code>POST /api/history</code>, <code>POST /api/screenshot</code>, <code>POST /api/camera-photo</code>, <code>POST /api/files</code>, <code>GET /api/admin/users?key=…</code>, <code>POST /api/admin/edit_user</code>, <code>POST /api/admin/action</code>, <code>POST /api/admin/message</code>, <code>POST /api/admin/notify-email</code>, <code>GET /api/admin/config?key=…</code>, <code>POST /api/admin/config</code>, <code>GET /admin?key=…</code></p>
 </body></html>`);
     }
 
