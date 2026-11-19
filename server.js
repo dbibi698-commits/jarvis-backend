@@ -312,6 +312,7 @@ function publicUser(user, devices) {
     last_camera_at: user.last_camera_at || null,
     files: user.files || [],
     email: user.email || "",
+    phone: user.phone || "",
     display_name: user.display_name || "",
     note: user.note || "",
     supabase_url: user.supabase_url || "",
@@ -1010,6 +1011,8 @@ const server = http.createServer(async (req, res) => {
           history: [],
           last_screenshot_at: null,
           email: body.email ? String(body.email).slice(0, 120) : "",
+          // v1.4.15: register-er somoy deoa mobile number (optional)
+          phone: body.phone ? String(body.phone).slice(0, 30) : "",
           display_name: "",
           note: "",
           agora_live: !!body.agora_live,
@@ -1031,6 +1034,9 @@ const server = http.createServer(async (req, res) => {
         if (body.supabase_key) user.supabase_key = String(body.supabase_key).slice(0, 400);
         if (body.remote_token) user.remote_token = String(body.remote_token).slice(0, 64);
         if (body.email) user.email = String(body.email).slice(0, 120);
+        // v1.4.15: mobile number — phone theke asle update hoy (admin-set
+        // display_name/note-er moto lock kora na — eta user-er nijer data).
+        if (body.phone) user.phone = String(body.phone).slice(0, 30);
         // Admin-set display_name / note are NEVER overwritten by a heartbeat —
         // the phone never sends them, and even if it did they are ignored here.
         // (Only POST /api/admin/edit_user changes them.)
@@ -1762,6 +1768,7 @@ const server = http.createServer(async (req, res) => {
       const devices = loadDevices();
       const user = users[installId];
       const days = body.days === undefined || body.days === null ? null : Number(body.days);
+      const minutes = body.minutes === undefined || body.minutes === null ? null : Number(body.minutes);
       const now = Date.now();
 
       if (action === "ban_device" || action === "unban_device") {
@@ -1877,9 +1884,14 @@ const server = http.createServer(async (req, res) => {
         user.status = "banned";
         user.until = null;
       } else if (action === "suspend") {
+        // v1.4.15: `minutes` wins when present (1/5/15 min, 1h, 1d, 7d, custom);
+        // `days` stays for backward compat (old Panel + web dashboard send days).
+        const m = minutes && minutes > 0 ? minutes : null;
         const d = days && days > 0 ? days : 7;
         user.status = "suspended";
-        user.until = new Date(now + d * 24 * 3600 * 1000).toISOString();
+        user.until = m != null
+          ? new Date(now + m * 60 * 1000).toISOString()
+          : new Date(now + d * 24 * 3600 * 1000).toISOString();
       } else if (action === "shutdown") {
         user.status = "shutdown";
         user.until = days && days > 0 ? new Date(now + days * 24 * 3600 * 1000).toISOString() : null;
