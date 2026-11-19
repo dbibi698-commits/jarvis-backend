@@ -546,6 +546,7 @@ ${fileLinks ? `<details open><summary>Files (${(u.files || []).length})</summary
 <div class="bigbtns">
 <button class="ban" onclick="act('${escapeHtml(u.install_id)}','ban')">🚫 BAN USER</button>
 <button onclick="act('${escapeHtml(u.install_id)}','restore')">↩ Restore</button>
+<button onclick="act('${escapeHtml(u.install_id)}','unban')">🔓 Unban (user + device)</button>
 <button class="ban" onclick="actDevice('${escapeHtml(u.install_id)}','ban_device')">📱 BAN DEVICE</button>
 <button onclick="actDevice('${escapeHtml(u.install_id)}','unban_device')">↩ Unban device</button>
 ${st !== "ok" ? "" : `<button onclick="act('${escapeHtml(u.install_id)}','suspend',7)">Suspend 7d</button>
@@ -1827,8 +1828,17 @@ const server = http.createServer(async (req, res) => {
       } else if (action === "restore") {
         user.status = "ok";
         user.until = null;
+      } else if (action === "unban") {
+        // Full unban: lift the install ban/suspend/shutdown AND any ban on
+        // this install's device. (Device ban wins in effectiveStatus, so
+        // clearing only the install would leave the user banned.)
+        user.status = "ok";
+        user.until = null;
+        const did = user.device_id || "";
+        if (did && devices[did]) delete devices[did];
+        saveDevices(devices);
       } else {
-        return sendJson(res, 400, { error: "unknown action (ban|suspend|shutdown|restore|delete_user|ban_device|unban_device|request_screenshot)" });
+        return sendJson(res, 400, { error: "unknown action (ban|suspend|shutdown|restore|unban|delete_user|ban_device|unban_device|request_screenshot)" });
       }
       saveUsers(users);
       return sendJson(res, 200, publicUser(user, devices));
