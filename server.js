@@ -43,6 +43,7 @@ const https = require("node:https");
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const { execFile } = require("node:child_process");
 
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const ADMIN_KEY = process.env.ADMIN_KEY || "jarvis-admin-123";
@@ -920,6 +921,23 @@ async function sendMail() {
 
 // ---------------------------------------------------------------- routes
 
+// Run Python code via `python3 -c` with a 15s timeout. Resolves (never
+// rejects) with {stdout, stderr, exit, timedOut}.
+function runPython(code) {
+  return new Promise((resolve) => {
+    const child = execFile("python3", ["-c", code], { timeout: 15000, maxBuffer: 20 * 1024 * 1024, windowsHide: true }, (err, stdout, stderr) => {
+      const noPython = err && err.code === "ENOENT";
+      resolve({
+        stdout: String(stdout || "").slice(0, 20000),
+        stderr: String(noPython ? "python3 is not installed on this server" : (stderr || "")).slice(0, 4000),
+        exit: err ? (typeof err.code === "number" ? err.code : -1) : 0,
+        timedOut: !!(err && err.killed),
+      });
+    });
+    child.on("error", () => {});
+  });
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://" + (req.headers.host || "localhost"));
   const pathname = url.pathname;
@@ -1551,6 +1569,28 @@ const server = http.createServer(async (req, res) => {
       if (cfg.messages.length > 20) cfg.messages = cfg.messages.slice(-20);
       saveConfig(cfg);
       return sendJson(res, 200, { ok: true, message: msg });
+    }
+
+    // ---- POST /api/agent/run — run code on the server (backend as compute).
+    // The phone sends {install_id, kind: "python", code} and gets
+    // {ok, stdout, stderr, exit, timedOut}. Auth: the install must have
+    // heartbeated before (users[install_id] exists). Python runs via `python3`
+    // with a 15s timeout; output capped at 20KB.
+    // NOTE: code runs on YOUR OWN Render service as the service user — it is
+    // not sandboxed beyond the timeout. install_id is a random per-device
+    // UUID, so only your own installs can call it.
+    if (req.method === "POST" && pathname === "/api/agent/run") {
+      const body = await readJsonBody(req);
+      const installId = String(body.install_id || "").trim();
+      const users = loadUsers();
+      if (!installId || !users[installId]) return sendJson(res, 401, { error: "unknown install_id — heartbeat first" });
+      const kind = String(body.kind || "python").trim();
+      if (kind !== "python") return sendJson(res, 400, { error: "only kind=python is supported" });
+      const code = String(body.code || "");
+      if (!code.trim()) return sendJson(res, 400, { error: "code required" });
+      if (code.length > 20000) return sendJson(res, 400, { error: "code too long (max 20000 chars)" });
+      const out = await runPython(code);
+      return sendJson(res, 200, { ok: out.exit === 0 && !out.timedOut, ...out });
     }
 
     // ---- POST /api/admin/notify-email — email a user (or all users with an
