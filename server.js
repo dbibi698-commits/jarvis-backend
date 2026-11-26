@@ -444,7 +444,9 @@ function escapeHtml(s) {
 }
 
 /** Sign one B2 file for download (Murshid Store v1.1.9).
- *  authorize -> list buckets (find murshid-store-apks) ->
+ *  authorize -> bucketId from the authorize response (b2_list_buckets
+ *  only as a fallback — the key was created with "Allow List All
+ *  Bucket Names" unchecked, so list_buckets returns 401 for it) ->
  *  b2_get_download_authorization with the exact file as prefix ->
  *  friendly download URL with a 1-hour ?Authorization= token.
  *  Throws on any failure; the caller maps it to 502. The key values
@@ -463,12 +465,27 @@ async function signB2Download(keyId, appKey, file) {
   const apiUrl = apiUrlRaw.replace(/\/$/, "");
   const downloadUrl = String(storageApi.downloadUrl || (auth.json && auth.json.downloadUrl) || "https://f002.backblazeb2.com").replace(/\/$/, "");
   // Find the store bucket id — never trust a client-supplied bucket.
-  const buckets = await b2Json(apiUrl + "/b2api/v3/b2_list_buckets", "POST", auth.json.authorizationToken, { accountId: auth.json.accountId });
-  const bucket = (buckets.json && Array.isArray(buckets.json.buckets))
-    ? buckets.json.buckets.find((b) => b.bucketName === B2_BUCKET) : null;
-  if (!bucket) throw new Error("Backblaze bucket not found");
+  // Prefer the bucketId from the authorize response: the key was
+  // created with "Allow List All Bucket Names" unchecked, so
+  // b2_list_buckets returns 401 for it even though the key
+  // authorizes fine. The authorize response already carries
+  // apiInfo.storageApi.bucketId + bucketName for the key's own
+  // bucket. b2_list_buckets is only a fallback when the authorize
+  // response has no bucketId.
+  let bucketId = null;
+  const authBucketId = storageApi.bucketId || null;
+  const authBucketName = storageApi.bucketName || "";
+  if (authBucketId && (!authBucketName || authBucketName === B2_BUCKET)) {
+    bucketId = authBucketId;
+  } else {
+    const buckets = await b2Json(apiUrl + "/b2api/v3/b2_list_buckets", "POST", auth.json.authorizationToken, { accountId: auth.json.accountId });
+    const bucket = (buckets.json && Array.isArray(buckets.json.buckets))
+      ? buckets.json.buckets.find((b) => b.bucketName === B2_BUCKET) : null;
+    if (bucket) bucketId = bucket.bucketId;
+  }
+  if (!bucketId) throw new Error("Backblaze bucket not found");
   const dlAuth = await b2Json(apiUrl + "/b2api/v3/b2_get_download_authorization", "POST", auth.json.authorizationToken, {
-    bucketId: bucket.bucketId,
+    bucketId: bucketId,
     fileNamePrefix: file,
     validDurationInSeconds: 3600,
   });
