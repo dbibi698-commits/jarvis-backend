@@ -453,11 +453,15 @@ async function signB2Download(keyId, appKey, file) {
   const basic = "Basic " + Buffer.from(keyId + ":" + appKey, "utf8").toString("base64");
   // NOTE: B2 rejects an empty body with 400 — authorize needs "{}".
   const auth = await b2Json("https://api.backblazeb2.com/b2api/v3/b2_authorize_account", "POST", basic, {});
-  if (auth.status !== 200 || !auth.json || !auth.json.authorizationToken || !auth.json.apiUrl) {
+  // B2 API v3 nests the URLs under apiInfo.storageApi — top-level
+  // apiUrl/downloadUrl do NOT exist in v3 responses.
+  const storageApi = (auth.json && auth.json.apiInfo && auth.json.apiInfo.storageApi) || {};
+  const apiUrlRaw = String(storageApi.apiUrl || (auth.json && auth.json.apiUrl) || "");
+  if (auth.status !== 200 || !auth.json || !auth.json.authorizationToken || !apiUrlRaw) {
     throw new Error("Backblaze authorization failed");
   }
-  const apiUrl = String(auth.json.apiUrl).replace(/\/$/, "");
-  const downloadUrl = String(auth.json.downloadUrl || "https://f002.backblazeb2.com").replace(/\/$/, "");
+  const apiUrl = apiUrlRaw.replace(/\/$/, "");
+  const downloadUrl = String(storageApi.downloadUrl || (auth.json && auth.json.downloadUrl) || "https://f002.backblazeb2.com").replace(/\/$/, "");
   // Find the store bucket id — never trust a client-supplied bucket.
   const buckets = await b2Json(apiUrl + "/b2api/v3/b2_list_buckets", "POST", auth.json.authorizationToken, { accountId: auth.json.accountId });
   const bucket = (buckets.json && Array.isArray(buckets.json.buckets))
