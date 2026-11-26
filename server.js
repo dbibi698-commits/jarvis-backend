@@ -71,6 +71,10 @@ const RESULTS_DIR = path.join(DATA_DIR, "results");
 // v1.7.0: Telegram bot control — token Render env var-e (TELEGRAM_BOT_TOKEN).
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TG_API = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN;
+// v1.1.9: Murshid Store B2 downloads — POST /api/b2-download-url signs
+// files in this bucket only. The key (B2_KEY_ID / B2_APPLICATION_KEY)
+// comes from Render env vars, never from code.
+const B2_BUCKET = "murshid-store-apks";
 function tgSend(chatId, text) {
   if (!TELEGRAM_BOT_TOKEN) return;
   const body = JSON.stringify({ chat_id: chatId, text: String(text).slice(0, 4000) });
@@ -437,6 +441,68 @@ function escapeHtml(s) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+/** Sign one B2 file for download (Murshid Store v1.1.9).
+ *  authorize -> list buckets (find murshid-store-apks) ->
+ *  b2_get_download_authorization with the exact file as prefix ->
+ *  friendly download URL with a 1-hour ?Authorization= token.
+ *  Throws on any failure; the caller maps it to 502. The key values
+ *  are never logged. */
+async function signB2Download(keyId, appKey, file) {
+  const basic = "Basic " + Buffer.from(keyId + ":" + appKey, "utf8").toString("base64");
+  // NOTE: B2 rejects an empty body with 400 — authorize needs "{}".
+  const auth = await b2Json("https://api.backblazeb2.com/b2api/v3/b2_authorize_account", "POST", basic, {});
+  if (auth.status !== 200 || !auth.json || !auth.json.authorizationToken || !auth.json.apiUrl) {
+    throw new Error("Backblaze authorization failed");
+  }
+  const apiUrl = String(auth.json.apiUrl).replace(/\/$/, "");
+  const downloadUrl = String(auth.json.downloadUrl || "https://f002.backblazeb2.com").replace(/\/$/, "");
+  // Find the store bucket id — never trust a client-supplied bucket.
+  const buckets = await b2Json(apiUrl + "/b2api/v3/b2_list_buckets", "POST", auth.json.authorizationToken, { accountId: auth.json.accountId });
+  const bucket = (buckets.json && Array.isArray(buckets.json.buckets))
+    ? buckets.json.buckets.find((b) => b.bucketName === B2_BUCKET) : null;
+  if (!bucket) throw new Error("Backblaze bucket not found");
+  const dlAuth = await b2Json(apiUrl + "/b2api/v3/b2_get_download_authorization", "POST", auth.json.authorizationToken, {
+    bucketId: bucket.bucketId,
+    fileNamePrefix: file,
+    validDurationInSeconds: 3600,
+  });
+  if (dlAuth.status !== 200 || !dlAuth.json || !dlAuth.json.authorizationToken) {
+    throw new Error("Backblaze download authorization failed");
+  }
+  const encoded = file.split("/").map((seg) => encodeURIComponent(seg)).join("/");
+  return downloadUrl + "/file/" + B2_BUCKET + "/" + encoded +
+    "?Authorization=" + encodeURIComponent(dlAuth.json.authorizationToken);
+}
+/** Minimal HTTPS JSON call (Backblaze B2 native API) — zero deps.
+ *  Returns { status, json, raw }. Never logs the body (it may carry
+ *  an auth token). */
+function b2Json(urlStr, method, token, bodyObj) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    const body = bodyObj ? JSON.stringify(bodyObj) : "";
+    const req = https.request(u, {
+      method,
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: token } : {}),
+        ...(body ? { "Content-Length": Buffer.byteLength(body) } : {}),
+      },
+    }, (res) => {
+      let raw = "";
+      res.on("data", (c) => { raw += c; });
+      res.on("end", () => {
+        let parsed = null;
+        try { parsed = JSON.parse(raw); } catch { /* keep null */ }
+        resolve({ status: res.statusCode || 0, json: parsed, raw });
+      });
+    });
+    req.on("error", reject);
+    req.setTimeout(15000, () => req.destroy(new Error("B2 request timed out")));
+    if (body) req.write(body);
+    req.end();
+  });
 }
 
 function shortId(id) {
@@ -1075,6 +1141,45 @@ const server = http.createServer(async (req, res) => {
       const uid = Math.max(0, parseInt(url.searchParams.get("uid") || "0", 10) || 0);
       const token = buildAgoraToken(appId, appCert, channel, uid);
       return sendJson(res, 200, { token, appId, channel, uid, expire: Math.floor(Date.now() / 1000) + 24 * 3600 });
+    }
+
+    // ---- POST /api/b2-download-url (Murshid Store v1.1.9 — B2 downloads)
+    // The B2 bucket is PRIVATE, so a plain file link returns 401. The
+    // Store app asks this endpoint for a fresh signed download URL
+    // (valid 1 hour) and downloads that instead. The B2 application key
+    // lives ONLY in Render env vars (B2_KEY_ID / B2_APPLICATION_KEY) —
+    // it is never hardcoded, never logged, and never sent to the app.
+    // Add the two env vars on Render (Dashboard > jarvis-backend-8ray
+    // > Environment) before this endpoint can sign anything; until
+    // then it answers 503. Signing uses B2's native API:
+    // authorize -> list buckets (find murshid-store-apks) ->
+    // b2_get_download_authorization with the exact file as prefix.
+    if (req.method === "POST" && pathname === "/api/b2-download-url") {
+      const body = await readJsonBody(req);
+      const file = String(body.file || "").trim();
+      // Validate: a relative object path inside the store bucket only.
+      if (!file) return sendJson(res, 400, { error: "file is required" });
+      if (file.length > 500) return sendJson(res, 400, { error: "file path too long" });
+      if (file.includes("..") || file.startsWith("/") || file.includes("://") ||
+          file.includes("\\") || /[\x00-\x1f]/.test(file)) {
+        return sendJson(res, 400, { error: "invalid file path" });
+      }
+      const keyId = process.env.B2_KEY_ID || "";
+      const appKey = process.env.B2_APPLICATION_KEY || "";
+      if (!keyId || !appKey) {
+        return sendJson(res, 503, { error: "B2 download signing is not configured on this backend (set B2_KEY_ID and B2_APPLICATION_KEY)" });
+      }
+      try {
+        // 20s overall guard: a stalled B2 call must never hang the
+        // endpoint (or the Store app waiting on it) forever.
+        const signed = await Promise.race([
+          signB2Download(keyId, appKey, file),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("B2 signing timed out")), 20000)),
+        ]);
+        return sendJson(res, 200, { url: signed });
+      } catch (e) {
+        return sendJson(res, 502, { error: "Backblaze signing failed" });
+      }
     }
 
     // ---- GET /api/live-status (tiny poll — the app asks every 10s while live matters)
