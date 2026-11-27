@@ -1203,6 +1203,65 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    // ---- POST /api/github/exchange (Mith Hera v1.4.48 — GitHub OAuth token exchange)
+    // The app's authorize page works, but GitHub's token endpoint will
+    // NOT exchange a code with PKCE alone — it demands the OAuth App's
+    // client_secret too ("The client_id and/or client_secret passed
+    // are incorrect"). The secret can NEVER live in the APK (anyone
+    // could pull it out), so the app sends the code + code_verifier
+    // here and this backend exchanges it with GitHub using the secret
+    // from the Render env var GITHUB_CLIENT_SECRET only. The authorize
+    // page the user sees is unchanged — one tap, same as before.
+    // The secret, the verifier, and the returned token are NEVER
+    // logged and NEVER sent anywhere except to GitHub in this one
+    // call. Until GITHUB_CLIENT_SECRET is set on Render this
+    // endpoint answers 503 (github_not_configured).
+    if (req.method === "POST" && pathname === "/api/github/exchange") {
+      const body = await readJsonBody(req);
+      const code = String(body.code || "").trim();
+      const verifier = String(body.code_verifier || "").trim();
+      const redirectUri = String(body.redirect_uri || "com.jarvis.ai://oauth/github").trim();
+      if (!code) return sendJson(res, 400, { error: "code is required" });
+      if (!verifier) return sendJson(res, 400, { error: "code_verifier is required" });
+      if (code.length > 500 || verifier.length > 200 || redirectUri.length > 500) {
+        return sendJson(res, 400, { error: "invalid request" });
+      }
+      const clientSecret = process.env.GITHUB_CLIENT_SECRET || "";
+      if (!clientSecret) {
+        return sendJson(res, 503, { error: "github_not_configured" });
+      }
+      const clientId = process.env.GITHUB_CLIENT_ID || "Ov23likS2LNovU51eYFt";
+      try {
+        const params = new URLSearchParams({
+          client_id: clientId,
+          client_secret: clientSecret,
+          code: code,
+          redirect_uri: redirectUri,
+          code_verifier: verifier,
+        });
+        const gh = await Promise.race([
+          fetch("https://github.com/login/oauth/access_token", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded",
+              "Accept": "application/json",
+            },
+            body: params.toString(),
+          }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("GitHub exchange timed out")), 20000)),
+        ]);
+        const j = await gh.json().catch(() => ({}));
+        const token = j.access_token || "";
+        if (!token) {
+          const err = String(j.error_description || j.error || "GitHub did not return a token");
+          return sendJson(res, 400, { error: err });
+        }
+        return sendJson(res, 200, { access_token: token });
+      } catch (e) {
+        return sendJson(res, 502, { error: "GitHub exchange failed" });
+      }
+    }
+
     // ---- GET /api/live-status (tiny poll — the app asks every 10s while live matters)
     if (req.method === "GET" && pathname === "/api/live-status") {
       const installId = String(url.searchParams.get("install_id") || "").trim();
